@@ -1,0 +1,182 @@
+#!/usr/bin/perl
+#   $Id: weather_cgi,v 1.5 2015/10/08 09:55:11 az Exp $
+# 
+#   File:		weather_cgi
+#   Date:		03 Oct 2015 20:37:57
+#   Author:		Alexander Zangerl <az@snafu.priv.at>
+# 
+#   Abstract:	cgi script for displaying the current weather and pre-made graphs
+#
+use strict;
+use CGI;
+use SQL::Abstract;
+use DateTime;
+use DBI;
+use Template;
+
+# configurables: none but the config file location
+my $conffile = "/etc/weather.conf";
+my %conf = eval { do "$conffile"; };
+die "cannot read or parse $conffile: $@ $!\n" if ($@ or !keys %conf);
+
+my $q = CGI->new;
+my $sitekey = $q->path_info;
+$sitekey =~ s!^/([^/]+).*$!$1!;
+
+if (!$conf{sites}->{$sitekey})
+{
+    print $q->header(-status => 400), $q->start_html("No such site"),
+    "You are trying to access a non-existent site.", $q->end_html;
+    exit 0;
+}
+
+my $db=DBI->connect("dbi:SQLite:dbname=".$conf{dbfile});
+die "can't connect to db: $!\n" if (!$db);
+my $sql=SQL::Abstract->new;
+
+my $template = join("", <DATA>);
+my $t = Template->new({INTERPOLATE => 1, EVAL_PERL => 1});
+
+# pull in the newest reading
+my $newest = get_weather_at($sitekey, undef);
+
+my %tvars = ( newest => DateTime->from_epoch(epoch => $newest->{time}, 
+					     time_zone => $conf{displaytz})->strftime($conf{datefmt}),
+	      sitename => $conf{sites}->{$sitekey}->{name},
+	      sitekey => $sitekey,
+
+	      wind_dir_avg1_name => deg2name($newest->{wind_dir_avg1}),
+	      wind_dir_avg2_name => deg2name($newest->{wind_dir_avg2}),
+	      wind_dir_avg10_name => deg2name($newest->{wind_dir_avg10}),
+	      wind_dir_gust10_name => deg2name($newest->{wind_dir_gust10}),
+	      
+	      ploturlbase => $conf{ploturlbase} );
+
+# limit the speed floats to one digit
+# and replace any undefs with N/A
+for my $k (keys %$newest)
+{
+    if (!defined $newest->{$k})
+    {
+	$tvars{$k} = "N/A";
+    }
+    else
+    {
+	$tvars{$k} = ($k =~ /^wind_speed/)? sprintf("%.1f", $newest->{$k}) : $newest->{$k};
+    }
+}
+
+print $q->header(-cache_control => "public, max-age=900");
+$t->process(\$template, \%tvars) or die $t->error;
+exit 0;
+
+# note: this is 100% pulled from weatherreceiver
+# returns the weather hash near given time X or newest
+# args: site, time (or undef for newest)
+# returns weather hash ref or undef
+sub get_weather_at
+{
+    my ($site, $when) = @_;
+
+    # specific time
+    if ($when)
+    {
+	my $precise = $db->selectrow_hashref("select time from $site where time = $when",
+					     {MaxRows=>1});
+	if ($precise && $precise->{time})
+	{
+	    $when = $precise->{time};
+	}
+	else
+	{
+	    # this may pick any reading within +/- 30s.
+	    my $nearest = $db->selectrow_hashref("select time from $site where abs(time-$when) < 30",
+						 {MaxRows=>1});
+	    return undef if (!$nearest or !$nearest->{time});
+	    $when = $nearest->{time};
+	}
+    }
+    # get latest observation
+    else
+    {
+	my $latest=$db->selectrow_hashref("select MAX(time) AS time from $site",
+					  {MaxRows=>1});
+	return undef if (!$latest or !$latest->{time});
+	$when=$latest->{time};
+    }
+
+    # get all the data at given time, as-is, no averaging
+    my ($stmt,@bind)=$sql->select($site,'*',
+				  {"time"=>$when});
+    my $res=$db->selectrow_hashref($stmt,{MaxRows=>1},@bind);
+
+    return $res;
+}
+
+sub deg2name
+{
+    my ($deg)=@_;
+
+    my @names=(qw(N NNE NE ENE E ESE SE SSE S SSW SW WSW W WNW NW NNW));
+    my $i=int(($deg*16/360)+.5)%16;
+    return $names[$i];
+}
+
+# html template goes here, read from the DATA filehandle
+__DATA__
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<head>
+  <head>
+    <title>Weather Observations at ${sitename}</title>
+  </head>
+  
+  <body>
+    <h1>${sitename}</h1>
+    <h2>Overview at ${newest}</h2>
+
+    <table>
+      <tr><td>Barometric Pressure</td><td>${barometer} hPa</td></tr>
+      <tr><td>Temperature</td><td>${outside_temp}° C</td></tr>
+      <tr><td>Relative Humidity</td><td>${outside_hum} %</td></tr>
+    </table>
+
+    <table>
+      <tr colspan="3"><th>Wind Direction</th></tr>
+      <tr><td>1 min avg.</td><td>${wind_dir_avg1_name}</td><td>${wind_dir_avg1}°</td></tr>
+      <tr><td>2 min avg.</td><td>${wind_dir_avg2_name}</td><td>${wind_dir_avg2}°</td></tr>
+      <tr><td>10 min avg.</td><td>${wind_dir_avg10_name}</td><td>${wind_dir_avg10}°</td></tr>
+      <tr><td>10 min gust</td><td>${wind_dir_gust10_name}</td><td>${wind_dir_gust10}°</td></tr>
+    </table>
+
+    <table>
+      <tr colspan="2"><th>Wind Speed</th></tr>
+      <tr><td>1 min avg.</td><td>${wind_speed_avg1} km/h</td></tr>
+      <tr><td>2 min avg.</td><td>${wind_speed_avg2} km/h</td></tr>
+      <tr><td>10 min avg.</td><td>${wind_speed_avg10} km/h</td></tr>
+      <tr><td>10 min gust</td><td>${wind_speed_gust10} km/h</td></tr>
+    </table>
+
+    <table>
+      <tr><td>Rain Rate</td><td>${rain_rate} mm/hr</td></tr>
+      <tr><td>Rain Last 15 min</td><td>${rain_15m} mm</td></tr>
+      <tr><td>Rain Last 60 min</td><td>${rain_60m} mm</td></tr>
+      <tr><td>Rain Last 24 hours</td><td>${rain_24h} mm</td></tr>
+    </table>
+
+    [% IF tx_batt_low == "TRUE" %]
+    <p><strong>Attention: Transmitter battery is Low!</strong></p>
+    [% END %]
+    [% IF tx_down == "TRUE" %]
+    <p><strong>Attention: Transmitter is Down!</strong></p>
+    [% END %]
+
+    <h2>Graphs</h2>
+    [% FOREACH graphtype IN [ "baro", "temp", "hum", "wind", "rain" ] %]
+    <div>
+      <img src="${ploturlbase}/${graphtype}_${sitekey}_2h.png">
+      <img src="${ploturlbase}/${graphtype}_${sitekey}_24h.png">
+    </div>
+    [% END %]
+  </body>
+</html>
+

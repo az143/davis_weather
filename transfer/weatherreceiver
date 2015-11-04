@@ -1,0 +1,531 @@
+#!/usr/bin/perl
+#   $Id: weatherreceiver,v 1.14 2015/10/12 09:06:37 az Exp $
+# 
+#   File:		weatherreceiver
+#   Date:		24 Sep 2015 19:44:39
+#   Author:		Alexander Zangerl <az@snafu.priv.at>
+# 
+#   Abstract:
+#	receive, store, display (and upload) condensed davis weather readings
+#
+use strict;
+use SQL::Abstract;
+use DBI;
+use IO::Socket;
+use File::Basename;
+use Sys::Syslog (qw(:standard :macros));
+use Proc::PID::File;
+use Getopt::Std;
+use DateTime;
+use Data::Dumper;
+use IO::Select;
+use Digest::MD5;
+use Proc::PID::File;
+use LWP::UserAgent;
+use URI::Escape;
+
+my $bn = basename($0);
+my %opts;
+my $usage="Usage:\t$bn [-f file.conf] -d
+\t$bn [-f...] [-a <time>] <locname>
+\t$bn [-f...] -r [-X|-Y <secs>] [-t N..M] <locname>
+\t$bn [-f...] -P <secs> <locname>
+\t$bn [-f...] {-X|-Y} <secs> <locname>
+\t$bn [-f...] -U <locname>
+-U: upload site's data to configured sites
+-f: use specific conf file
+-d: daemonize and receive data from net
+-a: show stats at time X
+-r: raw dump
+-t: interval N..M, -D..M, N..+D, N..now, -D..now.
+-P: purge records older than X seconds
+-X: return 0 if records (not tx_down) in last X seconds, 2 if not
+-Y: return 0 if records in the last X seconds, 2 if not\n";
+die $usage if (!getopts("drP:a:X:Y:t:f:U",\%opts) 
+	       or ($opts{d} && @ARGV) 
+	       or (!$opts{d} && @ARGV!=1));
+
+my $conffile = $opts{f} || "/etc/weather.conf";
+my %conf = eval { do "$conffile"; };
+die "cannot read or parse $conffile: $@ $!\n" if ($@ or !keys %conf);
+
+die $usage if (!$opts{d} && !$conf{sites}->{$ARGV[0]});
+
+my $db=DBI->connect("dbi:SQLite:dbname=".$conf{dbfile});
+die "can't connect to db: $!\n" if (!$db);
+my $sql=SQL::Abstract->new;
+
+for my $tname (keys %{$conf{sites}})
+{
+    if (!$db->tables(undef,undef,$tname,"TABLE"))
+    {
+	my $res=$db->do(scalar $sql->generate('create table',\$tname,
+					      ["time INTEGER PRIMARY KEY",
+					       "barometer REAL NOT NULL", # even present if the sensor is down
+					       "outside_temp REAL",
+					       "outside_hum INTEGER",
+					       "wind_dir INTEGER",
+					       "wind_dir_avg1 INTEGER",
+					       "wind_dir_avg2 INTEGER",
+					       "wind_dir_avg10 INTEGER",
+					       "wind_dir_gust10 INTEGER",
+
+					       "wind_speed REAL",
+					       "wind_speed_avg1 REAL",
+					       "wind_speed_avg2 REAL",
+					       "wind_speed_avg10 REAL",
+					       "wind_speed_gust10 REAL",
+			      
+					       "rain_rate REAL",
+					       "rain_15m REAL",
+					       "rain_60m REAL",
+					       "rain_24h REAL",
+					       "tx_batt_low BOOLEAN",
+					       "tx_down BOOLEAN"]));
+	die "can't create table $tname: ".$db->errstr."\n" if (!defined $res);
+    }
+}
+
+# net receiver daemon mode first
+if ($opts{d})
+{
+    $0=$bn;
+    
+    my $pidcheck = Proc::PID::File->new(verify=>1);
+    die ("another instance of $bn is running, exiting.\n")
+	if ($pidcheck->alive);
+    
+    chdir '/' or die "Can't chdir to /: $!";
+    open STDIN, '/dev/null'  or die "Can't read /dev/null: $!";
+    open STDOUT, '>/dev/null' or die "Can't write to /dev/null: $!";
+    
+    $SIG{__DIE__} = sub { die @_ if $^S; syslog("crit",$_[0]."\n"); };
+    $SIG{__WARN__} = sub { syslog("crit",$_[0]."\n"); };
+    
+    defined(my $pid = fork) or die "Can't fork: $!\n";
+    exit if $pid;
+
+    $pidcheck->touch;
+
+    openlog($bn,"ndelay,pid,nofatal",$conf{logfacility});
+    syslog(LOG_INFO,"starting up");
+    
+    my $sockselect=IO::Select->new;
+    my (%sock2loc, %stmthandles);
+    
+    # prep sockets
+    for my $site (keys %{$conf{sites}})
+    {
+	# prep udp listening socket
+	my $sock=IO::Socket::INET->new(LocalPort=>$conf{sites}->{$site}->{port},
+				       Proto=>"udp")
+	    or die "can't setup socket: $@\n";
+	$sock2loc{$sock}=$site;
+	$sockselect->add($sock);
+
+	# prep insertion and update statement handles (can be reused)
+	my ($stmt,undef)=$sql->insert($site,
+				      {time=>undef, barometer=>undef, outside_temp => undef,
+				       outside_hum => undef, wind_dir => undef, wind_dir_gust10 => undef,
+				       wind_speed => undef, wind_speed_gust10 => undef,
+				       wind_speed_avg2 => undef, wind_speed_avg10 => undef,
+				       rain_rate => undef, rain_15m => undef, rain_60m => undef,
+				       rain_24h => undef, tx_batt_low => undef, tx_down => undef});
+	$stmthandles{$site}->{insert} = $db->prepare($stmt);
+
+	($stmt, undef) = $sql->update($site, { wind_dir_avg1 => undef,
+					       wind_speed_avg1 => undef,
+					       wind_dir_avg2 => undef,
+					       wind_dir_avg10 => undef },
+				      { time => 1});
+	$stmthandles{$site}->{update} = $db->prepare($stmt);
+    }
+
+    # and now do not stop collecting data
+    while (my @ready=$sockselect->can_read)
+    {
+	for my $sock (@ready)
+	{
+	    my $site=$sock2loc{$sock};
+	    my $data;
+    
+	    my $otheraddy=recv($sock,$data,22,0);
+	    my $when=time;
+    
+	    # unpack the goodies
+	    my @goodies = unpack("n n C C C C C C C n n n n C a2", $data);
+	    my $got = substr($data,20,2);
+	    my $checksum = substr(Digest::MD5::md5_hex($conf{sites}->{$site}->{sharedsecret}
+						       .substr($data,0,20)), 0, 2);
+	    if ($got ne $checksum)
+	    {
+		syslog(LOG_WARNING, "site $site: checksums don't match, got $got but computed $checksum!");
+	    }
+	    else
+	    {
+		my %weatherdata = ( time => time,
+				    barometer => $goodies[0]/10,
+				    outside_temp => $goodies[1]/10,
+				    outside_hum => $goodies[2],
+				    
+				    wind_dir => int(0.5+ $goodies[3]/255*360),
+				    wind_dir_gust10 => int(0.5 + $goodies[4]/255*360),
+				    wind_speed => $goodies[5],
+				    wind_speed_gust10 => $goodies[6]/2,
+				    wind_speed_avg2 => $goodies[7]/2,
+				    wind_speed_avg10 => $goodies[8]/2,
+				    
+				    rain_rate => $goodies[9]/10,
+				    rain_15m => $goodies[10]/10,
+				    rain_60m => $goodies[11]/10,
+				    rain_24h => $goodies[12]/10,
+				    
+				    tx_batt_low => ($goodies[13] & 0x01)? "TRUE": "FALSE",
+				    tx_down => ($goodies[13] & 0x02 )? "TRUE": "FALSE" );
+		
+		# if the transmitter is down, then ONLY the barometer reading is reliable,
+		# all others can contain garbage in that case - so we blank it all
+		if ($weatherdata{tx_down} eq "TRUE")
+		{
+		    for my $ditchable (grep($_ !~ /^(time|barometer|tx_batt_low|tx_down)$/, keys %weatherdata))
+		    {
+			$weatherdata{$ditchable} = undef;
+		    }
+		}
+		else
+		{
+		    # sanity check based on known sensor ranges and reports from fetchdavis
+		    # data validity flags are in goodies[13]
+		    
+		    $weatherdata{barometer} = undef if ($weatherdata{barometer} > 1117 or
+							$weatherdata{barometer} < 677);
+		    $weatherdata{outside_hum} = undef if ($weatherdata{outside_hum} > 100); # actually raw 255
+		    $weatherdata{outside_temp} = undef if ($weatherdata{outside_temp} >= 1802
+							   || $goodies[13] & 4);
+		    $weatherdata{wind_dir} = $weatherdata{wind_dir_gust10} = undef
+			if ($goodies[13] & 8); # these are narrowed down to a byte, want full precision plus sanity
+		    $weatherdata{rain_rate} = undef if ($weatherdata{rain_rate} >= 6553 
+							|| $goodies[13] & 32);
+		    if ($goodies[13] & 16) # one or more wind speeds dud, scrutinize
+		    {
+			$weatherdata{wind_speed} = undef 
+				if ($weatherdata{wind_speed} > 200); # cut off arbitrarily at 200 kmh (hah!)
+			# wind_speed_avg2, avg10 and gust10 are in 0.5km/h, max out at 127.5km/h
+			for my $fixme (qw(wind_speed_avg2 wind_speed_avg10 wind_speed_gust10))
+			{
+			    $weatherdata{$fixme} = undef if ($weatherdata{$fixme} >= 127.5);
+			}
+		    }
+		}
+		
+		$db->begin_work;
+		my $res = $stmthandles{$site}->{insert}->execute($sql->values(\%weatherdata));
+		warn("can't insert into $site: ".$db->errstr."\n") if (!$res);
+		$db->commit;
+
+		# then and add avg wind dirs and speeds for 1 min, and dir for 2min and 10min
+		# note: we add a few seconds extra to cover packet delays etc; 65/125/610s
+		my ($stmt, @bind) = $sql->select($site,'AVG(wind_dir) AS wind_dir, AVG(wind_speed) as wind_speed',
+						 { "time" => { ">=" => $when - 65, "<=" => $when }});
+		# not quite clear why the bind ordering is reversed but so be it...
+		my $avg1min = $db->selectrow_hashref($stmt, {MaxRows => 1}, @bind);
+		$weatherdata{wind_speed_avg1} = $avg1min->{wind_speed};
+		$weatherdata{wind_dir_avg1} = int(0.5 + $avg1min->{wind_dir});
+		
+		@bind  = ($when, $when-125);
+		my $avg2min = $db->selectrow_hashref($stmt, {MaxRows => 1}, @bind);
+		$weatherdata{wind_dir_avg2} = int(0.5 + $avg2min->{wind_dir});    
+    
+		@bind  = ($when, $when-610);
+		my $avg10min = $db->selectrow_hashref($stmt, {MaxRows => 1}, @bind);
+		$weatherdata{wind_dir_avg10} = int(0.5 + $avg10min->{wind_dir});
+
+		# and update the record with the averages
+		$db->begin_work;
+		$res = $stmthandles{$site}->{update}->execute(
+		    $sql->values({ wind_dir_avg10 => $weatherdata{"wind_dir_avg10"},
+				   wind_dir_avg2 => $weatherdata{"wind_dir_avg2"},
+				   wind_dir_avg1 => $weatherdata{"wind_dir_avg1"},
+				   wind_speed_avg1 => $weatherdata{"wind_speed_avg1" } }),
+		    $when);
+		warn("can't update $site: ".$db->errstr."\n") if (!$res);
+		$db->commit;
+	    }
+	}
+    }
+    die "socket select failed: $!\n";
+}
+
+my $site=$ARGV[0];
+$opts{t}||="..";		# full dump of everything should be default
+
+my $now = time;
+
+# determine newest and oldest entries
+my ($stmt, @bind) = $sql->select($site, "MAX(time) AS end, MIN(time) AS start",
+				 $opts{X}? { "tx_down" => "FALSE" } : {});
+my ($limits) = $db->selectrow_hashref($stmt, {MaxRows => 1, Slice => {}},@bind);
+my ($oldest,$newest)=($limits->{start},$limits->{end});
+
+
+# this check is combinable with -r and -U
+# -Y: station communicates, -X: with transmitter alive
+if ($opts{X} or $opts{Y}) # aliveness check - station+sensor or station only
+{
+    my $isok = $now-($opts{X}||$opts{Y}) <= $newest;
+
+    exit 2 if (!$isok);
+    
+    exit 0 if (!$opts{r} && !$opts{U});
+};
+
+# raw dump mode
+if ($opts{r})
+{
+    my ($start,$end)=findinterval($oldest,$newest,$opts{t});
+    my %where=(time=>{-between=>[$start,$end]});
+    my ($stmt,@bind)=$sql->select($site,'*',\%where,{-asc=>'time'});
+    my $res=$db->selectall_arrayref($stmt,{Slice=>{}},@bind);
+    my $prevtime;
+    exit 3 if (!@$res);
+
+    my @exportables = (qw(time barometer outside_temp outside_hum 
+wind_dir wind_dir_gust10 wind_speed wind_speed_gust10
+wind_speed_avg2 wind_speed_avg10 rain_rate rain_15m rain_60m rain_24h tx_batt_low tx_down 
+wind_dir_avg1 wind_speed_avg1 wind_dir_avg2 wind_dir_avg10 ));
+
+    print "# ".join(" ", @exportables)."\n";
+
+    for my $entry (@$res)
+    {
+	
+	
+	print join("\t",@{$entry}{@exportables})."\n";
+    }
+}
+elsif ($opts{P})
+{
+    my ($stmt,@bind)=$sql->delete($site,{"time"=>{'<=',$now-$opts{P}}});
+    my $res=$db->do($stmt,undef,@bind);
+    die "can't prune $site: ".$db->errstr."\n" if (!defined $res);
+}
+elsif ($opts{U})
+{
+    die "no upload targets configured!\n"
+	if (ref($conf{sites}->{$site}) ne "HASH"
+	    or ref($conf{sites}->{$site}->{upload}) ne "HASH");
+
+    # get the newest weather from the db
+    my $weather = get_weather_at($site, undef);
+    die "no weather data for $site!\n" if (!$weather);
+    die "tx is down, not uploading anything\n" if ($weather->{tx_down} eq "TRUE");
+
+    my $ua = LWP::UserAgent->new;
+    $ua->env_proxy;
+    
+    for my $type (keys %{$conf{sites}->{$site}->{upload}})
+    {
+	my $thisone = $conf{sites}->{$site}->{upload}->{$type};
+	
+
+	if ($type eq "wow")
+	{
+	    # pretty horrible setup and formats, described at http://bom-wow.metoffice.gov.uk/support/dataformats
+	    # btw, docs are incorrect: YYYY-mm-DD HH:mm:ss with space %20-encoded is NOT accepted by the brits. idiots.
+	    my $targetsite = "http://wow.metoffice.gov.uk/automaticreading";
+	    
+	    my %upload = ( siteid => $thisone->{siteid},
+			   siteAuthenticationKey => $thisone->{sitepin},
+			   dateutc => POSIX::strftime("%Y-%m-%d+%H%%3A%M%%3A%S",
+						      gmtime($weather->{time})),
+			   softwaretype => "noyb",
+			   winddir => $weather->{wind_dir},
+			   windspeedmph => mph($weather->{wind_speed}),
+			   windgustdir => $weather->{wind_dir_gust10},
+			   windgustmph => mph($weather->{wind_speed_gust10}),
+			   humidity => $weather->{outside_hum},
+			   tempf => fahrenheit($weather->{outside_temp}),
+			   rainin => $weather->{rain_60m}/25.4,
+			   dailyrainin => $weather->{rain_24h}/25.4,
+			   baromin => $weather->{barometer} * 0.0295301 );
+	    
+	    my $response = $ua->post($targetsite, \%upload);
+	    if (!$response->is_success)
+	    {
+		die "Upload to $type failed: ".$response->status_line.$response->decoded_content."\n";
+	    }
+	}
+	elsif ($type eq "wunderground")
+	{
+	    # pretty horrible setup and formats, described at http://wiki.wunderground.com/index.php/PWS_-_Upload_Protocol
+	    # does NOT accept post. even bigger idiots.
+	    # at least it allows a few extra fields
+	    my $targetsite = "http://weatherstation.wunderground.com/weatherstation/updateweatherstation.php";
+
+	    my %upload = ( ID => $thisone->{id},
+			   PASSWORD => $thisone->{password},
+
+			   dateutc => POSIX::strftime("%Y-%m-%d+%H:%M:%S",
+						      gmtime($weather->{time})),
+			   softwaretype => "noyb",
+			   
+			   winddir => $weather->{wind_dir},
+			   winddir_avg2m => $weather->{wind_dir_avg2},
+			   windspeedmph => mph($weather->{wind_speed}),
+			   
+			   windgustdir_10m => $weather->{wind_dir_gust10},
+			   windgustmph_10m => mph($weather->{wind_speed_gust10}),
+			   			   
+			   humidity => $weather->{outside_hum},
+			   tempf => fahrenheit($weather->{outside_temp}),
+			   rainin => $weather->{rain_60m}/25.4,
+			   dailyrainin => $weather->{rain_24h}/25.4,
+			   baromin => $weather->{barometer} * 0.0295301 );
+
+	    my $targeturl = URI->new($targetsite);
+	    $targeturl->query_form(\%upload);
+	    my $response = $ua->get($targeturl);
+	    if (!$response->is_success)
+	    {
+		die "Upload to $type failed: ".$response->status_line.$response->decoded_content."\n";
+	    }
+	}
+	else
+	{
+	    die "unknown upload type $type!\n";
+	}
+    }
+}
+# display details mode
+else
+{
+    my $res = get_weather_at($site, $opts{a});
+    die "no readings available for $site!\n" if (!$res);
+    my $when = $res->{time};
+    
+    my $dtn=DateTime->from_epoch(epoch=>$when, time_zone=>$conf{displaytz});
+    print "newest reading: ".$dtn->strftime($conf{datefmt})." ("
+	.(time-$when)." seconds ago)\n";
+
+    print "
+barometer:\t\t$res->{barometer} hPa
+temperature:\t\t$res->{outside_temp} °C
+humidity:\t\t$res->{outside_hum} %
+
+wind direction:\t\t$res->{wind_dir} ° = ".deg2name($res->{wind_dir})."
+wind speed:\t\t$res->{wind_speed} km/h
+
+wind dir avg 1min:\t$res->{wind_dir_avg1} ° = ".deg2name($res->{wind_dir_avg1})."
+wind speed avg 1min:\t".sprintf("%.1f", $res->{wind_speed_avg1})." km/h
+
+wind dir avg 2min:\t$res->{wind_dir_avg2} ° = ".deg2name($res->{wind_dir_avg2})."
+wind speed avg 2min:\t".sprintf("%.1f", $res->{wind_speed_avg2})." km/h
+
+wind dir avg 10min:\t$res->{wind_dir_avg10} ° = ".deg2name($res->{wind_dir_avg10})."
+wind speed avg 10min:\t".sprintf("%.1f", $res->{wind_speed_avg10})." km/h
+
+wind dir 10min gust:\t$res->{wind_dir_gust10} ° = ".deg2name($res->{wind_dir_gust10})."
+wind speed 10min gust:\t".sprintf("%.1f", $res->{wind_speed_gust10})." km/h
+
+rain rate:\t\t$res->{rain_rate} mm/hr
+rain 15min:\t\t$res->{rain_15m} mm
+rain 60min:\t\t$res->{rain_60m} mm
+rain 24hr:\t\t$res->{rain_24h} mm
+
+tx battery:\t\t".($res->{tx_batt_low} eq "TRUE"? "LOW":"ok")."
+tx working:\t\t".($res->{tx_down} eq "TRUE"? "DOWN":"ok")."\n\n";
+}
+
+$db->disconnect or die "can't close db: ".$db->errstr."\n";
+exit 0;
+
+# returns the weather hash near given time X or newest
+# args: site, time (or undef for newest)
+# returns weather hash ref or undef
+sub get_weather_at
+{
+    my ($site, $when) = @_;
+
+    # specific time
+    if ($when)
+    {
+	my $precise = $db->selectrow_hashref("select time from $site where time = $when",
+					     {MaxRows=>1});
+	if ($precise && $precise->{time})
+	{
+	    $when = $precise->{time};
+	}
+	else
+	{
+	    # this may pick any reading within +/- 30s.
+	    my $nearest = $db->selectrow_hashref("select time from $site where abs(time-$when) < 30",
+						 {MaxRows=>1});
+	    return undef if (!$nearest or !$nearest->{time});
+	    $when = $nearest->{time};
+	}
+    }
+    # get latest observation
+    else
+    {
+	my $latest=$db->selectrow_hashref("select MAX(time) AS time from $site",
+					  {MaxRows=>1});
+	return undef if (!$latest or !$latest->{time});
+	$when=$latest->{time};
+    }
+
+    # get all the data at given time, as-is, no averaging
+    my ($stmt,@bind)=$sql->select($site,'*',
+				  {"time"=>$when});
+    my $res=$db->selectrow_hashref($stmt,{MaxRows=>1},@bind);
+
+    return $res;
+}
+
+sub deg2name
+{
+    my ($deg)=@_;
+
+    my @names=(qw(N NNE NE ENE E ESE SE SSE S SSW SW WSW W WNW NW NNW));
+    my $i=int(($deg*16/360)+.5)%16;
+    return $names[$i];
+}
+
+sub mph
+{
+    my ($in) = @_;
+    
+    return ($in / 1.609344);
+}
+sub fahrenheit
+{
+    my ($in) = @_;
+    return ($in * 9/5)+32;
+}
+
+
+# NNN..MMM or -XY..MMM or NNN..+XY or NNN..now or -XY..now
+# missing NNN means from the oldest, missing MMM means to the newest
+# .. can't be left out
+# returns interval start and end, (0,0) if dud spec
+sub findinterval
+{
+    my ($oldest,$newest,$intspec)=@_;
+    my ($start,$end);
+
+    return (0,0) if ($intspec!~/^((-)?\d+)?\.\.((\+)?\d+|now)?$/);
+    $start=$1||$oldest; $end=($3 eq "now"?$now:$3||$newest);
+
+    my ($relstart,$relend)=($2,$4);
+    return (0,0) if ($relstart && $relend); # two relatives can't work
+    
+    $start+=$end if ($relstart); # negative sign is present
+    $end+=$start if ($relend);
+
+    return ($start,$end);
+}
+    
+	
+
+	
+
+    

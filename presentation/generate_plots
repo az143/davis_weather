@@ -1,0 +1,211 @@
+#!/usr/bin/perl
+#   $Id: generate_plots,v 1.8 2015/10/10 01:59:46 az Exp $
+# 
+#   File:		generate_plots
+#   Date:		03 Oct 2015 13:40:27
+#   Author:		Alexander Zangerl <az@snafu.priv.at>
+# 
+#   Abstract:
+#	generate various weather plots via gnuplot 
+#
+use strict;
+use Template;
+use File::Temp;
+
+# configurables: mainly the config file
+my $conffile = "/etc/weather.conf";
+my $minlive = 900;	# don't do anything if no new data in the last 15min
+# centos...
+my $fontpath = "/usr/share/fonts/dejavu";
+# debian # my $fontpath = "/usr/share/fonts/truetype/ttf-dejavu";
+my $font = "DejaVuSans,10";
+# silly gnuplot/gd combo is unhappy otherwise
+$ENV{GDFONTPATH}= $fontpath;
+
+# templates for the plot files
+my %templates = (
+    "shared" => '
+set terminal png enhanced font "${font}" size 640,240
+set output "${output}"
+set grid
+set timefmt "%s" 
+set xdata time
+set datafile separator "\t"
+unset key # fixme maybe on for the multis?
+set autoscale y
+set lmargin 8 # to ensure axes line up precisely
+set rmargin 8
+', 
+     
+    "shared_7200" => '
+set xtics 900
+set format x "%H:%M"
+',
+    
+    "shared_86400" => '
+set xtics 7200
+set format x "%k"
+',
+
+    "wind_7200" => '
+set terminal png enhanced font "${font}" size 640,550
+set multiplot layout 2,1 title "${sitename} Wind Last ${dur} Hours"
+
+# extend range a bit so as to show a line at N, even with the small img size
+set yrange [-2:362]
+set ytics ("N" -2, "NE" 45, "E" 90, "SE" 135, "S" 180, "SW" 225, "W" 270, "NW" 315, "N" 362)
+set y2tics ("N" -2, "NE" 45, "E" 90, "SE" 135, "S" 180, "SW" 225, "W" 270, "NW" 315, "N" 362)
+
+set key below
+plot "${input}" using (\$1+${tzoffset}):6 title "10min gust" with lines lc rgb "#32CD32", \
+"" using (\$1+${tzoffset}):17 title "1min avg" with lines lc rgb "#1E90FF"
+
+# second plot: setup
+set ylabel "km/h"
+set y2label "km/h"
+set autoscale y
+set yrange [0:]
+unset ytics
+set ytics
+unset y2tics
+set y2tics
+set key below
+
+plot "${input}"  using (\$1+${tzoffset}):8 title "10min gust" with filledcurve x1 fs solid 0.5 lc rgb "#ff8c00", \
+"" using (\$1+${tzoffset}):10 title "10min avg" with filledcurve x1 fs solid 0.5 lc rgb "#87CEEB", \
+"" using (\$1+${tzoffset}):18 title "1min avg" with lines lc rgb "#1E90FF"
+
+unset multiplot
+',
+     
+    "wind_86400" => '
+set terminal png enhanced font "${font}" size 640,550
+set multiplot layout 2,1 title "${sitename} Wind Last ${dur} Hours"
+
+# extend range a bit so as to show a line at N, even with the small img size
+set yrange [-2:362]
+set ytics ("N" -2, "NE" 45, "E" 90, "SE" 135, "S" 180, "SW" 225, "W" 270, "NW" 315, "N" 362)
+set y2tics ("N" -2, "NE" 45, "E" 90, "SE" 135, "S" 180, "SW" 225, "W" 270, "NW" 315, "N" 362)
+
+set key below
+plot "${input}" using (\$1+${tzoffset}):6 title "10min gust" with lines lc rgb "#32CD32", \
+"" using (\$1+${tzoffset}):20 title "10min avg" with lines lc rgb "#1E90FF"
+
+
+# second plot: setup
+set ylabel "km/h"
+set y2label "km/h"
+set autoscale y
+set yrange [0:]
+unset ytics
+set ytics
+unset y2tics
+set y2tics
+set key below
+
+plot "${input}" using (\$1+${tzoffset}):8 title "10min gust" with filledcurve x1 fs solid 0.5 lc rgb "#ff8c00", \
+"" using (\$1+${tzoffset}):10 title "10min avg" with filledcurve x1 fs solid 0.5 lc rgb "#1E90FF"
+
+unset multiplot
+',
+     
+    "temp" => '
+set title "${sitename} Temperature Last ${dur} Hours"
+set ylabel "°C"
+plot "${input}" using (\$1+${tzoffset}):3 title "Temperature" with lines lc rgb \'#FFA500\'
+',
+    
+    "baro" => '
+set title "${sitename} Pressure Last ${dur} Hours"
+unset yrange
+set ylabel "hPa"
+plot "${input}" using (\$1+${tzoffset}):2 title "Pressure" with lines lc rgb \'#C71585\'',
+
+    "hum" => '
+set title "${sitename} Rel. Humidity Last ${dur} Hours"
+set yrange [0:100]
+set ylabel "%"
+plot "${input}" using (\$1+${tzoffset}):4 title "Humidity" with lines lc rgb \'#4dbeee\'
+',
+
+    # show last 15m and last 60m for the 2h graph, 60m and 24h for the 1d graph
+    "rain_7200" => '
+set title "${sitename} Rain Last ${dur} Hours"
+set ylabel "mm"
+set yrange [0:]
+set key below
+plot "${input}" using (\$1+${tzoffset}):13 title "last 60 min" with filledcurve x1 fs solid 0.5 lc rgb "#1E90FF", \
+"" using (\$1+${tzoffset}):12 title "last 15 min" with filledcurve x1 fs solid 0.5 lc rgb "#87CEEB", \
+"" using (\$1+${tzoffset}):11 title "rate" with lines lc rgb \'#0000CD\'
+',
+
+    "rain_86400" => '
+set title "${sitename} Rain Last ${dur} Hours"
+set ylabel "mm"
+set yrange [0:]
+set key below
+plot "${input}" using (\$1+${tzoffset}):14 title "last 24 h" with filledcurve x1 fs solid 0.5 lc rgb "#1E90FF", \
+"" using (\$1+${tzoffset}):13 title "last 60 min" with filledcurve x1 fs solid 0.5 lc rgb "#87CEEB", \
+"" using (\$1+${tzoffset}):11 title "rate" with lines lc rgb \'#0000CD\'
+'
+    );
+
+
+my %conf = eval { do "$conffile"; };
+die "cannot read or parse $conffile: $@ $!\n" if ($@ or !keys %conf);
+
+mkdir($conf{plotdir}, 0755) if (!-d $conf{plotdir});
+
+# make tempdir
+my $td = File::Temp::tempdir("/tmp/plots.XXXXXXX", CLEANUP => 1);
+my $gplog =  "$td/gnuplot.log";
+open(GPL, ">>$gplog") or die "cannot open $gplog: $!\n";
+
+my $t = Template->new({INTERPOLATE => 1, EVAL_PERL => 1});
+
+for my $sitekey (keys %{$conf{sites}})
+{
+    my %tvars = ( tzoffset => $conf{tzoffset}, 
+		  sitename => $conf{sites}->{$sitekey}->{name},
+		  font => $font);
+
+    # export the plotdata for 2h, 24h
+    for my $period (7200, 86400)
+    {
+	my $now = time;
+	my $extra = $period == 7200? ($now % 900) : ($now % 7200);	
+	# extend by that to get line up at quarter hours/2 hours
+	my $actual = $period+$extra;
+	my $res = system("weatherreceiver -X $minlive -r -t -$actual..now $sitekey > $td/plotdata");
+	die "dump failed: $? $!\n"
+	    if ($res or $res>>8);
+	$tvars{input} = "$td/plotdata";
+	
+	# prep plotcommands and run through gnuplot
+	# temp
+	# baro
+	# hum
+	# combo wind dir+speed
+	# rain rate + last hr
+	for my $entry ( "temp", "baro", "hum", "wind", "rain")
+	{
+	    my $targetfile = "$conf{plotdir}/${entry}_${sitekey}_".($period/3600)."h.png";
+	    $tvars{output} = $targetfile;
+	    $tvars{dur} = $period/3600;
+	    
+	    unlink($targetfile) if (-f $targetfile);
+	    
+	    # combine the relevant templates
+	    my $thistempl = $templates{shared} . $templates{"shared_$period"}
+	    . $templates{$entry} . $templates{"${entry}_${period}"};
+	    my $expanded;
+	    $t->process(\$thistempl, \%tvars, \$expanded); # or output \*X directly into gnuplot;
+	    
+	    print GPL "---\nentry $entry, period $period, plotcmd\n---\n$expanded\n---\n";
+	    open(X, "|gnuplot - >>$gplog 2>&1") or die "cannot exec gnuplots: $!\n";
+	    print X $expanded."\n";
+	    close(X) or die "gnuplot for $entry and $period hr failed: $!\n";
+	}
+    }
+}
+exit 0;
