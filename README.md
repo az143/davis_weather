@@ -12,7 +12,8 @@ davis console at configurable intervals, then condenses and uploads the
 data to a server on the net,
 
 * a data collector program (in perl) that listens for such uploads and saves the
-data in an sqlite database,
+data in an sqlite database, and optionally uploads it to weather underground
+and/or the bom/uk-metoffice weather observations website,
 
 * and a graph generator tool (using gnuplot) and a cgi script to
 present readings and graphs. both are written in perl.
