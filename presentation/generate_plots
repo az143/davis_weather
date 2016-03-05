@@ -46,6 +46,43 @@ set xtics 7200
 set format x "%k"
 ',
 
+
+	"windrose" => '
+set terminal png enhanced font "${font}" size 640,400
+set title "${sitename} Wind Direction Last ${dur} Hours"
+
+# reset unwanted shared stuff
+unset xdata
+unset format 
+unset lmargin
+unset rmargin
+unset grid
+unset xtics
+unset ytics
+unset timefmt
+
+set angles degrees
+set polar
+set grid polar 45
+
+set border 0
+set view equal xy
+set size square
+
+set rtics axis scale default mirror autofreq 
+unset key
+
+#set colorbox user origin 0.9,0.05 size 0.02,0.7
+#set cbrange [0:50]
+set cblabel "km/h"
+
+set style data impulse
+set palette rgb 33,13,10
+
+plot "${input}" using (360-\$5+90):7:7 lc palette z lw 3
+
+',
+
 	"wind_7200" => '
 set terminal png enhanced font "${font}" size 640,550
 set multiplot layout 2,1 title "${sitename} Wind Last ${dur} Hours"
@@ -206,8 +243,9 @@ for my $sitekey (keys %{$conf{sites}})
 		# baro
 		# hum
 		# combo wind dir+speed
+		# windrose
 		# rain rate + last hr
-		for my $entry ( "temp", "baro", "hum", "wind", "rain")
+		for my $entry ( "temp", "baro", "hum", "wind", "windrose", "rain")
 		{
 			next if ($period == 1209600 && $entry ne "rain" ); # only that one for 14d
 		
