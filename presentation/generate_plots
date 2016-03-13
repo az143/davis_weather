@@ -10,14 +10,17 @@
 use strict;
 use Template;
 use File::Temp;
+use File::Slurp;
 
 # configurables: mainly the config file
 my $conffile = "/etc/weather.conf";
 my $minlive = 900;	# don't do anything if no new data in the last 15min
 # centos...
 my $fontpath = "/usr/share/fonts/dejavu";
-# debian # my $fontpath = "/usr/share/fonts/truetype/ttf-dejavu";
+# debian
+$fontpath = "/usr/share/fonts/truetype/ttf-dejavu" if (!-d $fontpath);
 my $font = "DejaVuSans,10";
+
 # silly gnuplot/gd combo is unhappy otherwise
 $ENV{GDFONTPATH}= $fontpath;
 
@@ -211,7 +214,6 @@ mkdir($conf{plotdir}, 0755) if (!-d $conf{plotdir});
 # make tempdir
 my $td = File::Temp::tempdir("/tmp/plots.XXXXXXX", CLEANUP => 1);
 my $gplog =  "$td/gnuplot.log";
-open(GPL, ">>$gplog") or die "cannot open $gplog: $!\n";
 
 my $t = Template->new({INTERPOLATE => 1, EVAL_PERL => 1});
 
@@ -261,10 +263,17 @@ for my $sitekey (keys %{$conf{sites}})
 	    my $expanded;
 	    $t->process(\$thistempl, \%tvars, \$expanded); # or output \*X directly into gnuplot;
 	    
-	    print GPL "---\nentry $entry, period $period, plotcmd\n---\n$expanded\n---\n";
-	    open(X, "|gnuplot - >>$gplog 2>&1") or die "cannot exec gnuplots: $!\n";
+	    open(X, "|gnuplot - >$gplog 2>&1") or die "cannot exec gnuplots: $!\n";
 	    print X $expanded."\n";
-	    close(X) or die "gnuplot for $entry and $period hr failed: $!\n";
+	    if (!close(X))
+			{
+				my $res = $? >> 8;
+
+				print STDERR "error: gnuplot for $entry and $period failed with exit code $res\n"
+						. "---input start---\n$expanded\n---input end, log start---\n"
+						. read_file($gplog)."\n---log end---\n\n";
+				exit 1;
+			}
 		}
 	}
 }

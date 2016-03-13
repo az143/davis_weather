@@ -192,7 +192,7 @@ __DATA__
 		</div>
 
     <h2>Graphs</h2>
-    [% FOREACH graphtype IN [ "baro", "temp", "hum", "wind", "rain" ] %]
+    [% FOREACH graphtype IN [ "baro", "temp", "hum", "wind", "windrose", "rain" ] %]
     <div>
       <img src="${ploturlbase}/${graphtype}_${sitekey}_2h.png">
       <img src="${ploturlbase}/${graphtype}_${sitekey}_24h.png">
