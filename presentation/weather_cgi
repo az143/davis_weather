@@ -28,6 +28,7 @@ if (!$conf{sites}->{$sitekey})
     "You are trying to access a non-existent site.", $q->end_html;
     exit 0;
 }
+my $thissite = $conf{sites}->{$sitekey};
 
 my $db=DBI->connect("dbi:SQLite:dbname=".$conf{dbfile});
 die "can't connect to db: $!\n" if (!$db);
@@ -41,10 +42,36 @@ my $newest = get_weather_at($sitekey, undef);
 my $dtn = DateTime->from_epoch(epoch => $newest->{time},
 															 time_zone => $conf{displaytz});
 
+my (@links);
+if (ref($thissite->{upload}) eq "HASH" 
+		&& keys %{$thissite->{upload}})
+{
+	for my $uploadtype (sort keys %{$thissite->{upload}})
+	{
+		my ($linktext,$linkaddress);
+		if ($uploadtype eq "wunderground")
+		{
+			$linktext = "Weather Underground Site ".$thissite->{upload}->{$uploadtype}->{id};
+			$linkaddress = "http://www.wunderground.com/personal-weather-station/dashboard?ID="
+					.$thissite->{upload}->{$uploadtype}->{id};
+		}
+		else
+		{
+			$linktext = "Australian BOM WOW Site ".$thissite->{upload}->{$uploadtype}->{siteid};
+			$linkaddress = "http://bom-wow.metoffice.gov.uk/weather/view?siteID="
+					.$thissite->{upload}->{$uploadtype}->{siteid};
+		}
+		push @links, "<a href=\"$linkaddress\">$linktext</a>";
+	}
+}	
+			
 my %tvars = ( newest => $dtn->strftime($conf{datefmt}),
 							sitename => $conf{sites}->{$sitekey}->{name},
 							sitekey => $sitekey,
 
+							has_uploads => scalar @links,
+							upload_links => \@links,
+							
 							wind_dir_avg1_name => deg2name($newest->{wind_dir_avg1}),
 							wind_dir_avg2_name => deg2name($newest->{wind_dir_avg2}),
 							wind_dir_avg10_name => deg2name($newest->{wind_dir_avg10}),
@@ -137,59 +164,69 @@ sub deg2name
 # html template goes here, read from the DATA filehandle
 __DATA__
 <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
-<head>
-  <head>
+		<head>
+		<head>
     <title>Weather Observations at ${sitename}</title>
-  </head>
-  
-  <body>
+		</head>
+		
+		<body>
     <h1>${sitename}</h1>
     <h2>Overview at ${newest}</h2>
 
     <table border="1" style="float: left; margin-right: 10px;">
-      <tr><td>Barometric Pressure</td><td>${barometer} hPa</td></tr>
-      <tr><td>Temperature</td><td>${outside_temp}° C</td></tr>
-      <tr><td>Relative Humidity</td><td>${outside_hum} %</td></tr>
+		<tr><td>Barometric Pressure</td><td>${barometer} hPa</td></tr>
+		<tr><td>Temperature</td><td>${outside_temp}° C</td></tr>
+		<tr><td>Relative Humidity</td><td>${outside_hum} %</td></tr>
     </table>
 
 		
     <table border="1" style="float: left; margin-right: 10px;">
-			<tr><th colspan="4">Wind</th></tr>
-      <tr><th>When</th><th colspan="2">Direction</th><th>Speed</th></tr>
-      <tr><td>1 min avg.</td><td>${wind_dir_avg1_name}</td><td>${wind_dir_avg1}°</td><td>${wind_speed_avg1} km/h</td></tr>
-      <tr><td>2 min avg.</td><td>${wind_dir_avg2_name}</td><td>${wind_dir_avg2}°</td><td>${wind_speed_avg2} km/h</td></tr>
-      <tr><td>10 min avg.</td><td>${wind_dir_avg10_name}</td><td>${wind_dir_avg10}°</td><td>${wind_speed_avg10} km/h</td></tr>
-      <tr><td>10 min gust</td><td>${wind_dir_gust10_name}</td><td>${wind_dir_gust10}°</td><td>${wind_speed_gust10} km/h</td></tr>
+		<tr><th colspan="4">Wind</th></tr>
+		<tr><th>When</th><th colspan="2">Direction</th><th>Speed</th></tr>
+		<tr><td>1 min avg.</td><td>${wind_dir_avg1_name}</td><td>${wind_dir_avg1}°</td><td>${wind_speed_avg1} km/h</td></tr>
+		<tr><td>2 min avg.</td><td>${wind_dir_avg2_name}</td><td>${wind_dir_avg2}°</td><td>${wind_speed_avg2} km/h</td></tr>
+		<tr><td>10 min avg.</td><td>${wind_dir_avg10_name}</td><td>${wind_dir_avg10}°</td><td>${wind_speed_avg10} km/h</td></tr>
+		<tr><td>10 min gust</td><td>${wind_dir_gust10_name}</td><td>${wind_dir_gust10}°</td><td>${wind_speed_gust10} km/h</td></tr>
     </table>
 
     <table border="1" style="float: left; margin-right: 10px;">
-			<tr><th colspan="2" style="text-align: left">Rain Today</th></tr>
-      <tr title="This row indicates the severity of the current rain fall. The rain rate it is most recent rain measurement extrapolated to a full hour."><td>Current Rate</td><td>${rain_rate} mm/hr</td></tr>
-      <tr title="This is the total rainfall (in mm per m^2) during the last quarter hour."><td>Last 15 min</td><td>${rain_15m} mm</td></tr>
-      <tr title="This is the total rainfall (in mm per m^2) during the last full hour."><td>Last 60 min</td><td>${rain_60m} mm</td></tr>
-      <tr title="This row shows the total rain fallen in the last 24 hours (*not* since midnight)."><td>Last 24 hours</td><td>${rain_24h} mm</td></tr>
+		<tr><th colspan="2" style="text-align: left">Rain Today</th></tr>
+		<tr title="This row indicates the severity of the current rain fall. The rain rate it is most recent rain measurement extrapolated to a full hour."><td>Current Rate</td><td>${rain_rate} mm/hr</td></tr>
+		<tr title="This is the total rainfall (in mm per m^2) during the last quarter hour."><td>Last 15 min</td><td>${rain_15m} mm</td></tr>
+		<tr title="This is the total rainfall (in mm per m^2) during the last full hour."><td>Last 60 min</td><td>${rain_60m} mm</td></tr>
+		<tr title="This row shows the total rain fallen in the last 24 hours (*not* since midnight)."><td>Last 24 hours</td><td>${rain_24h} mm</td></tr>
     </table>
 
 		<table border="1" style="float: left; margin-right: 10px;">
-			<tr><th colspan="4" style="text-align: left">Recent Rain</th></tr>
-			<tr><th>Last 7 Days</th><th>Daily Rain</th><th>Week Before</th><th>Daily Rain</th></tr>
-			<tr><td>${day1} (${day1_ago})</td><td>${day1_rain}</td><td>${day8} (${day8_ago})</td><td>${day8_rain}</td></tr>
-			<tr><td>${day2} (${day2_ago})</td><td>${day2_rain}</td><td>${day9} (${day9_ago})</td><td>${day9_rain}</td></tr>
-			<tr><td>${day3} (${day3_ago})</td><td>${day3_rain}</td><td>${day10} (${day10_ago})</td><td>${day10_rain}</td></tr>
-			<tr><td>${day4} (${day4_ago})</td><td>${day4_rain}</td><td>${day11} (${day11_ago})</td><td>${day11_rain}</td></tr>
-			<tr><td>${day5} (${day5_ago})</td><td>${day5_rain}</td><td>${day12} (${day12_ago})</td><td>${day12_rain}</td></tr>
-			<tr><td>${day6} (${day6_ago})</td><td>${day6_rain}</td><td>${day13} (${day13_ago})</td><td>${day13_rain}</td></tr>
-			<tr><td>${day7} (${day7_ago})</td><td>${day7_rain}</td><td>${day14} (${day14_ago})</td><td>${day14_rain}</td></tr>
+		<tr><th colspan="4" style="text-align: left">Recent Rain</th></tr>
+		<tr><th>Last 7 Days</th><th>Daily Rain</th><th>Week Before</th><th>Daily Rain</th></tr>
+		<tr><td>${day1} (${day1_ago})</td><td>${day1_rain}</td><td>${day8} (${day8_ago})</td><td>${day8_rain}</td></tr>
+		<tr><td>${day2} (${day2_ago})</td><td>${day2_rain}</td><td>${day9} (${day9_ago})</td><td>${day9_rain}</td></tr>
+		<tr><td>${day3} (${day3_ago})</td><td>${day3_rain}</td><td>${day10} (${day10_ago})</td><td>${day10_rain}</td></tr>
+		<tr><td>${day4} (${day4_ago})</td><td>${day4_rain}</td><td>${day11} (${day11_ago})</td><td>${day11_rain}</td></tr>
+		<tr><td>${day5} (${day5_ago})</td><td>${day5_rain}</td><td>${day12} (${day12_ago})</td><td>${day12_rain}</td></tr>
+		<tr><td>${day6} (${day6_ago})</td><td>${day6_rain}</td><td>${day13} (${day13_ago})</td><td>${day13_rain}</td></tr>
+		<tr><td>${day7} (${day7_ago})</td><td>${day7_rain}</td><td>${day14} (${day14_ago})</td><td>${day14_rain}</td></tr>
 		</table>
-			
+		
 		<div style="clear: both">
-			[% IF tx_batt_low == "TRUE" %]
-			<p><strong>Attention: Transmitter battery is Low!</strong></p>
-			[% END %]
-			[% IF tx_down == "TRUE" %]
-			<p><strong>Attention: Transmitter is Down!</strong></p>
-			[% END %]
+		[% IF tx_batt_low == "TRUE" %]
+		<p><strong>Attention: Transmitter battery is Low!</strong></p>
+		[% END %]
+		[% IF tx_down == "TRUE" %]
+		<p><strong>Attention: Transmitter is Down!</strong></p>
+		[% END %]
 		</div>
+
+		[% IF has_uploads %]
+    <h2>Data Upload</h2>
+    <p>This weather data is uploaded to community sites at:</p>
+		<ul>
+		[% FOREACH link IN upload_links %]
+		<li>[% link %]</li>
+		[% END %]
+		</ul>
+		[% END %]
 
     <h2>Graphs</h2>
     [% FOREACH graphtype IN [ "baro", "temp", "hum", "wind", "windrose", "rain" ] %]
