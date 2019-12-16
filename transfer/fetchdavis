@@ -23,6 +23,7 @@ use IO::Handle;
 use Getopt::Std;
 use Time::HiRes qw(sleep);
 use Text::CSV;
+use Errno;
 
 # configurables go into /etc/weather.conf
 my $conffile = "/etc/fetchdavis.conf";
@@ -33,8 +34,8 @@ die "cannot read or parse $conffile: $@ $!\n"
 for my $fixme (qw(serialport speed timeout sharedsecret 
 readinterval sensorid targethost targetport logfacility))
 {
-    die "config file $conffile lacks required setting $fixme\n"
-	if (!defined $conf{$fixme});
+	die "config file $conffile lacks required setting $fixme\n"
+			if (!defined $conf{$fixme});
 }
 
 my %opts;
@@ -53,15 +54,15 @@ $Data::Dumper::Sortkeys=1;
 openlog(basename($0), "ndelay,pid,nofatal", $conf{logfacility});
 if (!$opts{d})
 {
-    chdir '/' or die "Can't chdir to /: $!";
-    open STDIN, '/dev/null'  or die "Can't read /dev/null: $!";
-    open STDOUT, '>/dev/null' or die "Can't write to /dev/null: $!";
+	chdir '/' or die "Can't chdir to /: $!";
+	open STDIN, '/dev/null'  or die "Can't read /dev/null: $!";
+	open STDOUT, '>/dev/null' or die "Can't write to /dev/null: $!";
 
-    $SIG{__DIE__}=sub { die @_ if $^S; syslog(LOG_CRIT,$_[0]."\n"); };
-    $SIG{__WARN__}=sub { syslog(LOG_CRIT,$_[0]."\n"); };
+	$SIG{__DIE__}=sub { die @_ if $^S; syslog(LOG_CRIT,$_[0]."\n"); };
+	$SIG{__WARN__}=sub { syslog(LOG_CRIT,$_[0]."\n"); };
 
-    defined(my $pid = fork) or die "cannot fork: $!\n";
-    exit 0 if ($pid);		# parent does nothing
+	defined(my $pid = fork) or die "cannot fork: $!\n";
+	exit 0 if ($pid);		# parent does nothing
 }
 $pidcheck->touch;
 
@@ -70,14 +71,17 @@ syslog(LOG_INFO, "starting up");
 my ($dumpfhandle, $csv, $wantsheader);
 if (my $dumpf = $opts{l})
 {
-    $csv = Text::CSV->new;
-    $wantsheader = (!-f $dumpf);
-    if (!open($dumpfhandle, ">>$dumpf"))
-    {
-	faillog("cannot write to logfile $dumpf: $!");
-	undef $dumpfhandle;	#  fall back to no logging
-    }
-    $dumpfhandle->autoflush(1);
+	$csv = Text::CSV->new;
+	$wantsheader = (!-f $dumpf);
+	if (open($dumpfhandle, ">>$dumpf"))
+	{
+		$dumpfhandle->autoflush(1);
+	}
+	else
+	{
+		faillog("cannot write to logfile $dumpf: $!");
+		undef $dumpfhandle;	#  fall back to no logging
+	}
 }
 
 # set up the serial port
@@ -89,130 +93,130 @@ binmode($davis);
 # io::stty is buggy, so we do it with stty
 # (changing every one thing separately via posix::termios is too tedious)
 die "stty failed: $!\n" if (system("stty","-F",$conf{serialport},
-				   ($conf{speed}, 
-				    qw(raw cs8 -cstopb -parenb -parodd clocal 
+																	 ($conf{speed}, 
+																		qw(raw cs8 -cstopb -parenb -parodd clocal 
 cread -hup -echo -echoe -echok -echonl -opost min 0)), "time", int($conf{timeout}*10)) >> 8);
 
 my ($cyclecount, %sensorhealth, $sock);
 while (1)
 {
-    my $err;
-    
-    # wake it up first, or wait a bit, try a ping test, then retry again.
-    if ($err = wake_up())
-    {
-	debug("wake_up ".($err? "failed: $err": "OK"))  if ($opts{d});
-	sleep(5);
-	ping_test();
-	sleep(5);
-	next;
-    }
-    ++$cyclecount;
-
-    # every 5 minutes update the sensor situation OR when the received packets are zero/undef
-    $err = check_sensors() if (!$sensorhealth{received} 
-			       or $cyclecount % int(300/$conf{readinterval}) == 1);
-    # if no sensors are around then there's no real need to ask for weather data, but
-    # we'll try anyway - we'll get the baro at least.
-
-
-    # every 30m do a quick startup check (e.g. time), OR whenever the sensor check reports no packets
-    if ($cyclecount % int(1800/$conf{readinterval}) == 1 or !$sensorhealth{received})
-    {
-	debug("running startup_check");
-	$err = startup_check();
-	debug("startup_check ".($err? "failed: $err": "OK"))  if ($opts{d});
-    }
-
-    
-    debug("running getdata") if ($opts{d});
-    ($err, my $weather) = getdata();
-    if ($err)
-    {
-	debug("getdata ".($err? "failed: $err": "OK")) if ($opts{d});
-	sleep(10);
-	check_sensors();	# if we can't get any useful info, check the sensors!
-	sleep(10);
-	next;
-    }
-    else
-    {
-	# bit 0: sensor low batt, 
-	# bit 1: sensor seems dead,
-	# bit 2: outside_temp out of range (but data IS sent)
-	# bit 3: any wind dir(s) out of range
-	# bit 4: any wind speed(s) out of range
-	# bit 5: rain rate out of range
-	my $health = ($weather->{tx_batt_low} & $conf{sensorid}); 
-	$health |= 2 if (!$sensorhealth{ok});
-	$health |= 4 if ($weather->{outside_temp_range});
-	$health |= 8 if ($weather->{wind_dir_range} || $weather->{wind_dir_gust10_range});
-	$health |= 16 if ($weather->{wind_speed_range}
-			  || $weather->{wind_speed_avg2_range}
-			  || $weather->{wind_speed_avg10_range}
-			  || $weather->{wind_speed_gust10_range});
-	$health |= 32 if ($weather->{rain_rate_range});
-
-	debug("weather and health status: ".Dumper($weather, \%sensorhealth, \$health)) if ($opts{d});
+	my $err;
 	
-
-	
-	# prep the response data we'd like to keep/upload
-	# 22 bytes of payload plus 8 bytes udp plus 20 bytes ip header = 50 bytes total
-	my $rawpacket = pack("n n C C C C C C C n n n n C",
-			     int(0.5+ $weather->{barometer}*10), # 0.1mbar
-			     $weather->{outside_temp_range}? 65535 : int(0.5 + $weather->{outside_temp}*10), # 0.1degree c
-
-			     $weather->{outside_hum}, # straight percent
-			     int($weather->{wind_dir}/360*255), # direction mapped to 0..255
-			     int($weather->{wind_dir_gust10}/360*255), # ditto
-			     # sanitized values, please!
-			     $weather->{wind_speed_range}? 255 : int(0.5 + $weather->{wind_speed}), # straight kmh
-			     $weather->{wind_speed_gust10_range}? 255 : int(0.5 + 2*$weather->{wind_speed_gust10}), # in 0.5 kmh
-			     $weather->{wind_speed_avg2_range}? 255 : int(0.5 + 2*$weather->{wind_speed_avg2}),  # in 0.5 kmh
-			     $weather->{wind_speed_avg10_range}? 255 : int(0.5 + 2*$weather->{wind_speed_avg10}), # in 0.5 kmh
-
-			     $weather->{rain_rate_range}? 65535 : int(0.5 + $weather->{rain_rate}*10), # 0.1mm/hr, current rate
-			     int(0.5 + $weather->{rain_15m}*10), # 0.1mm, cumulative
-			     int(0.5 + $weather->{rain_60m}*10), # ditto
-			     int(0.5 + $weather->{rain_24h}*10), # ditto
-			     
-			     $health);
-	
-	my $checksum = Digest::MD5::md5_hex($conf{sharedsecret}.$rawpacket);
-	$rawpacket .= substr($checksum,0,2);
-
-	$sock ||= IO::Socket::INET->new(PeerPort=>$conf{targetport},
-					PeerAddr=>$conf{targethost},
-					Proto=>"udp")
-	    or faillog("Cannot create socket to $conf{targethost}:$conf{targetport}: $!");
-
-	if ($sock)
+	# wake it up first, or wait a bit, try a ping test, then retry again.
+	if ($err = wake_up())
 	{
+		debug("wake_up ".($err? "failed: $err": "OK"))  if ($opts{d});
+		sleep(5);
+		ping_test();
+		sleep(5);
+		next;
+	}
+	++$cyclecount;
+
+	# every 5 minutes update the sensor situation OR when the received packets are zero/undef
+	$err = check_sensors() if (!$sensorhealth{received} 
+														 or $cyclecount % int(300/$conf{readinterval}) == 1);
+	# if no sensors are around then there's no real need to ask for weather data, but
+	# we'll try anyway - we'll get the baro at least.
+
+
+	# every 30m do a quick startup check (e.g. time), OR whenever the sensor check reports no packets
+	if ($cyclecount % int(1800/$conf{readinterval}) == 1 or !$sensorhealth{received})
+	{
+		debug("running startup_check");
+		$err = startup_check();
+		debug("startup_check ".($err? "failed: $err": "OK"))  if ($opts{d});
+	}
+
+	
+	debug("running getdata") if ($opts{d});
+	($err, my $weather) = getdata();
+	if ($err)
+	{
+		debug("getdata ".($err? "failed: $err": "OK")) if ($opts{d});
+		sleep(10);
+		check_sensors();	# if we can't get any useful info, check the sensors!
+		sleep(10);
+		next;
+	}
+	else
+	{
+		# bit 0: sensor low batt, 
+		# bit 1: sensor seems dead,
+		# bit 2: outside_temp out of range (but data IS sent)
+		# bit 3: any wind dir(s) out of range
+		# bit 4: any wind speed(s) out of range
+		# bit 5: rain rate out of range
+		my $health = ($weather->{tx_batt_low} & $conf{sensorid}); 
+		$health |= 2 if (!$sensorhealth{ok});
+		$health |= 4 if ($weather->{outside_temp_range});
+		$health |= 8 if ($weather->{wind_dir_range} || $weather->{wind_dir_gust10_range});
+		$health |= 16 if ($weather->{wind_speed_range}
+											|| $weather->{wind_speed_avg2_range}
+											|| $weather->{wind_speed_avg10_range}
+											|| $weather->{wind_speed_gust10_range});
+		$health |= 32 if ($weather->{rain_rate_range});
+
+		debug("weather and health status: ".Dumper($weather, \%sensorhealth, \$health)) if ($opts{d});
+		
+
+		
+		# prep the response data we'd like to keep/upload
+		# 22 bytes of payload plus 8 bytes udp plus 20 bytes ip header = 50 bytes total
+		my $rawpacket = pack("n n C C C C C C C n n n n C",
+												 int(0.5+ $weather->{barometer}*10), # 0.1mbar
+												 $weather->{outside_temp_range}? 65535 : int(0.5 + $weather->{outside_temp}*10), # 0.1degree c
+
+												 $weather->{outside_hum}, # straight percent
+												 int($weather->{wind_dir}/360*255), # direction mapped to 0..255
+												 int($weather->{wind_dir_gust10}/360*255), # ditto
+												 # sanitized values, please!
+												 $weather->{wind_speed_range}? 255 : int(0.5 + $weather->{wind_speed}), # straight kmh
+												 $weather->{wind_speed_gust10_range}? 255 : int(0.5 + 2*$weather->{wind_speed_gust10}), # in 0.5 kmh
+												 $weather->{wind_speed_avg2_range}? 255 : int(0.5 + 2*$weather->{wind_speed_avg2}),  # in 0.5 kmh
+												 $weather->{wind_speed_avg10_range}? 255 : int(0.5 + 2*$weather->{wind_speed_avg10}), # in 0.5 kmh
+
+												 $weather->{rain_rate_range}? 65535 : int(0.5 + $weather->{rain_rate}*10), # 0.1mm/hr, current rate
+												 int(0.5 + $weather->{rain_15m}*10), # 0.1mm, cumulative
+												 int(0.5 + $weather->{rain_60m}*10), # ditto
+												 int(0.5 + $weather->{rain_24h}*10), # ditto
+												 
+												 $health);
+		
+		my $checksum = Digest::MD5::md5_hex($conf{sharedsecret}.$rawpacket);
+		$rawpacket .= substr($checksum,0,2);
+
+		$sock ||= IO::Socket::INET->new(PeerPort=>$conf{targetport},
+																		PeerAddr=>$conf{targethost},
+																		Proto=>"udp")
+				or faillog("Cannot create socket to $conf{targethost}:$conf{targetport}: $!");
+
+		if ($sock)
+		{
 	    my $sent=send($sock,$rawpacket,0);
 	    if ($sent != length($rawpacket))
 	    {
-		debug("sending packet to $conf{targethost}:$conf{targetport} failed: $!") if ($opts{d});
-		syslog(LOG_ERR, "Sending ".length($rawpacket)."bytes to $conf{targethost}:$conf{targetport} failed: $!");
-		shutdown($sock, 2);
-		undef $sock; # recreate it during the next cycle
+				debug("sending packet to $conf{targethost}:$conf{targetport} failed: $!") if ($opts{d});
+				syslog(LOG_ERR, "Sending ".length($rawpacket)."bytes to $conf{targethost}:$conf{targetport} failed: $!");
+				shutdown($sock, 2);
+				undef $sock; # recreate it during the next cycle
 	    }
-	}
-	 
-	if ($dumpfhandle && $csv)
-	{
+		}
+		
+		if ($dumpfhandle && $csv)
+		{
 	    if ($wantsheader)
 	    {
-		$csv->print($dumpfhandle, ["time", sort keys %$weather]);
-		print $dumpfhandle "\n";
-		undef $wantsheader;
+				$csv->print($dumpfhandle, ["time", sort keys %$weather]);
+				print $dumpfhandle "\n";
+				undef $wantsheader;
 	    }
 	    $csv->print($dumpfhandle, [time, map { $weather->{$_} } (sort keys %$weather)]);
 	    print $dumpfhandle "\n";
+		}
 	}
-    }
-    debug("sleeping $conf{readinterval}...");
-    sleep $conf{readinterval};
+	debug("sleeping $conf{readinterval}...");
+	sleep $conf{readinterval};
 }
 exit 0;
 
@@ -220,28 +224,28 @@ exit 0;
 # no args, returns nothing
 sub catch_up
 {
-    debug("catching up with input") if ($opts{d});
+	debug("catching up with input") if ($opts{d});
 
-    # no read timeout here, please
-    my $termios = POSIX::Termios->new();
-    $termios->getattr(fileno($davis)) or die "cannot get termios info: $!\n";
+	# no read timeout here, please
+	my $termios = POSIX::Termios->new();
+	$termios->getattr(fileno($davis)) or die "cannot get termios info: $!\n";
 
-    # do not block - set vtime to 0 means get only what's already buffered
-    my $origtimeout = $termios->getcc(&POSIX::VTIME);
-    $termios->setcc(&POSIX::VTIME, 0);
-    $termios->setattr(fileno($davis), &POSIX::TCSANOW) or die "setattr failed: $!\n";
+	# do not block - set vtime to 0 means get only what's already buffered
+	my $origtimeout = $termios->getcc(&POSIX::VTIME);
+	$termios->setcc(&POSIX::VTIME, 0);
+	$termios->setattr(fileno($davis), &POSIX::TCSANOW) or die "setattr failed: $!\n";
 
-    # the non-blocking read doesn't work if attempted with read().
-    my $dummy;
-    while (my $count = sysread($davis, $dummy, 1))
-    {
-	debug(sprintf("catch up read $count, data %02x = %s", $dummy, $dummy)) if ($opts{d});
-    }
-    # and restore the old timeout
-    $termios->setcc(&POSIX::VTIME, $origtimeout);
-    $termios->setattr(fileno($davis), &POSIX::TCSANOW) or die "setattr failed: $!\n";
-    
-    debug("catch up read reported error $!") if ($! && $opts{d});
+	# the non-blocking read doesn't work if attempted with read().
+	my $dummy;
+	while (my $count = sysread($davis, $dummy, 1))
+	{
+		debug(sprintf("catch up read $count, data %02x = %s", $dummy, $dummy)) if ($opts{d});
+	}
+	# and restore the old timeout
+	$termios->setcc(&POSIX::VTIME, $origtimeout);
+	$termios->setattr(fileno($davis), &POSIX::TCSANOW) or die "setattr failed: $!\n";
+	
+	debug("catch up read reported error $!") if ($! && $opts{d});
 }
 
 # reads N bytes from the davis
@@ -249,27 +253,31 @@ sub catch_up
 # returns: (count, data), count 0 means at eof/timeout, count undef means error
 sub davis_read
 {
-    my ($howmany) = @_;
-    my ($response, $count, $buffer, $counted);
+	my ($howmany) = @_;
+	my ($response, $count, $buffer, $counted);
 
-    debug("starting davis_read of $howmany bytes") if ($opts{d});
-    while ($howmany)
-    {
-	# timeout is handled by termios' vtime, BUT we may get just one byte per sysread
-	$count = sysread($davis, $buffer, $howmany);
-	$counted += $count;
-	$howmany -= $count;
-	$response .= $buffer;
-	
-	if (!$count)
+	debug("starting davis_read of $howmany bytes") if ($opts{d});
+	while ($howmany)
 	{
+		# timeout is handled by termios' vtime, BUT we may get just one byte per sysread
+		if ($count = sysread($davis, $buffer, $howmany))
+		{
+	    $counted += $count;
+	    $howmany -= $count;
+	    $response .= $buffer;
+		}
+		else
+		{
+	    next if ((!defined $count)
+							 && ($! == Errno::EWOULDBLOCK || $! == Errno::EAGAIN));
+
 	    debug("read returned 0 bytes!") if ($opts{d});
 	    return (0,undef);
+		}
 	}
-    }
-
-    debug("returning $counted bytes: ", hexdump($response)) if ($opts{d});
-    return ($counted, $response);
+	
+	debug("returning $counted bytes: ", hexdump($response)) if ($opts{d});
+	return ($counted, $response);
 }
 
 # writes given bytes to the davis
@@ -277,61 +285,61 @@ sub davis_read
 # returns: count written. count undef means error.
 sub davis_write
 {
-    my ($data) = @_;
+	my ($data) = @_;
 
-    # timeout is handled by termios' vtime
-    my $count = syswrite($davis, $data);
-    return $count;
+	# timeout is handled by termios' vtime
+	my $count = syswrite($davis, $data);
+	return $count;
 }
 
 
 # print all inputs to stderr but only if debugging is on
 sub debug
 {
-    my (@msg) = @_;
-    return if (!$opts{d});
+	my (@msg) = @_;
+	return if (!$opts{d});
 
-    my ($time,$usecs) = Time::HiRes::gettimeofday;
-    print STDERR POSIX::strftime("%T",localtime($time)).".".int($usecs/1e4)." ",
-    @msg,"\n";
+	my ($time,$usecs) = Time::HiRes::gettimeofday;
+	print STDERR POSIX::strftime("%T",localtime($time)).".".int($usecs/1e4)." ",
+	@msg,"\n";
 }
 
 # log, debug-print and return the given error message
 sub faillog
 {
-    my ($error) = @_;
- 
-    syslog(LOG_ERR, $error);
-    debug($error) if ($opts{d});
-    return $error;
+	my ($error) = @_;
+	
+	syslog(LOG_ERR, $error);
+	debug($error) if ($opts{d});
+	return $error;
 }
 
 # try to wake the thing 10 times, returns undef if ok, error otherwise
 # also logs+prints error message
 sub wake_up
 {
-    for my $try (1..5)
-    {
-	return faillog("wakeup write failed: $!") 
-	    if (!davis_write("\n"));
-	my ($count, $str) = davis_read(2);
-	return undef if ($count == 2 and $str eq "\n\r"); # what a yucky response format...
-	sleep(0.1*$try);				  # "reasonable interval" *sigh*
-	catch_up;
-    }
-    return faillog("wakeup timeout!");
+	for my $try (1..5)
+	{
+		return faillog("wakeup write failed: $!") 
+				if (!davis_write("\n"));
+		my ($count, $str) = davis_read(2);
+		return undef if ($count == 2 and $str eq "\n\r"); # what a yucky response format...
+		sleep(0.1*$try);				  # "reasonable interval" *sigh*
+		catch_up;
+	}
+	return faillog("wakeup timeout!");
 }
 
 # sends test string and checks the response, returns undef if ok, error otherwise
 # also logs+prints error message
 sub ping_test
 {
-    catch_up;
-    return faillog("ping write failed: $!") if (!davis_write("TEST\n"));
-    my ($count, $response) = davis_read(8); # newline, then string plus extra cr
-    return undef if ($count and $response eq "\n\rTEST\n\r");
+	catch_up;
+	return faillog("ping write failed: $!") if (!davis_write("TEST\n"));
+	my ($count, $response) = davis_read(8); # newline, then string plus extra cr
+	return undef if ($count and $response eq "\n\rTEST\n\r");
 
-    return faillog("ping returned incorrect response 0x".hexdump($response));
+	return faillog("ping returned incorrect response 0x".hexdump($response));
 }
 
 # on startup, check the time is alright. if dud reset the clock.
@@ -339,41 +347,41 @@ sub ping_test
 # returns undef if ok, error otherwise; # also logs and debug-prints error
 sub startup_check
 {
-    my $err = wake_up;
-    return $err if ($err);
-
-    my $now = time;
-    my $davistime = gettime();
-    return "gettime failed" if (!defined $davistime);
-    
-    my $delta = $now - $davistime; 
-    $delta *= -1 if ($delta < 0);
-    debug("got davis time $davistime, system $now, delta $delta") if ($opts{d});
-    
-    if (!$davistime or $delta > 120)
-    {
-	$err = settime(time);
+	my $err = wake_up;
 	return $err if ($err);
-	sleep(3); # the console seems to need some extra time after settime?
-    }
 
-    # send an rxtest to and go to main screen
-    return faillog("sending rxtest cmd failed: $!") 
-	if (!davis_write("RXTEST\n"));
-    my ($count, $response) = davis_read(6);
-    return faillog("rxtest returned incorrect response 0x".hexdump($response)) 
-	if ($count != 6 or $response ne "\n\rOK\n\r");
-    sleep(1);		# and give it another moment...
+	my $now = time;
+	my $davistime = gettime();
+	return "gettime failed" if (!defined $davistime);
+	
+	my $delta = $now - $davistime; 
+	$delta *= -1 if ($delta < 0);
+	debug("got davis time $davistime, system $now, delta $delta") if ($opts{d});
+	
+	if (!$davistime or $delta > 120)
+	{
+		$err = settime(time);
+		return $err if ($err);
+		sleep(3); # the console seems to need some extra time after settime?
+	}
 
-    return undef;
+	# send an rxtest to and go to main screen
+	return faillog("sending rxtest cmd failed: $!") 
+			if (!davis_write("RXTEST\n"));
+	my ($count, $response) = davis_read(6);
+	return faillog("rxtest returned incorrect response 0x".hexdump($response)) 
+			if ($count != 6 or $response ne "\n\rOK\n\r");
+	sleep(1);		# and give it another moment...
+
+	return undef;
 }
- 
+
 # return hexdump of one input string as space-separated hex output
 sub hexdump
 {
-    my ($indata) = @_;
-    my @array = unpack('C*', $indata);
-    return join(" ", (map { sprintf("%2.2x", $_) } (@array)));
+	my ($indata) = @_;
+	my @array = unpack('C*', $indata);
+	return join(" ", (map { sprintf("%2.2x", $_) } (@array)));
 }
 
 # try to figure out if our sensor is reachable
@@ -382,270 +390,270 @@ sub hexdump
 # also logs and debug-prints errors 
 sub check_sensors
 {
-    # the RECEIVERS command is useless, it returns 0 even 15 minutes after the sensor 
-    # has come up and is shown on the console...and the RXCHECK command's response is variable-length,
-    # and the counters can't be reset - short of a power off. yuktastic.
-    debug("asking for rx diagnostics") if ($opts{d});
+	# the RECEIVERS command is useless, it returns 0 even 15 minutes after the sensor 
+	# has come up and is shown on the console...and the RXCHECK command's response is variable-length,
+	# and the counters can't be reset - short of a power off. yuktastic.
+	debug("asking for rx diagnostics") if ($opts{d});
 
-    catch_up;
-    my $now = time;
-    return faillog("sending rxcheck cmd failed: $!") if (!davis_write("RXCHECK\n"));
-    my ($count,$preamble) = davis_read(6);
-    return faillog("rxcheck cmd timeout")if (!$count);
-    return faillog("rxcheck invalid response, 0x".hexdump($preamble)) if ($preamble ne "\n\rOK\n\r");
-    my ($fullresponse, $one);
-    do 
-    {
-	($count, $one) = davis_read(1);
-	return faillog("rxcheck response timeout") if (!$count);
-	$fullresponse .= $one;
-    } while ($one ne "\r" && length($fullresponse) < 80 ); # safety-stop after a while
-
-    if ($fullresponse =~ /(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/)
-    {
-	my ($recvd, $missed, $resync, $maxstreak, $crcerrs) = ($1,$2,$3,$4,$5);
-	debug("rxcheck reported $recvd packets, $missed missed, $resync resyncs, $maxstreak streak, $crcerrs crc errors")
-	    if ($opts{d});
-
-	my $lastcheck = $sensorhealth{lastcheck};
-	my $lastrecvd = $sensorhealth{received};
-
-	if ($lastcheck and $lastrecvd and $lastrecvd <= $recvd)
+	catch_up;
+	my $now = time;
+	return faillog("sending rxcheck cmd failed: $!") if (!davis_write("RXCHECK\n"));
+	my ($count,$preamble) = davis_read(6);
+	return faillog("rxcheck cmd timeout")if (!$count);
+	return faillog("rxcheck invalid response, 0x".hexdump($preamble)) if ($preamble ne "\n\rOK\n\r");
+	my ($fullresponse, $one);
+	do 
 	{
+		($count, $one) = davis_read(1);
+		return faillog("rxcheck response timeout") if (!$count);
+		$fullresponse .= $one;
+	} while ($one ne "\r" && length($fullresponse) < 80 ); # safety-stop after a while
+
+	if ($fullresponse =~ /(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/)
+	{
+		my ($recvd, $missed, $resync, $maxstreak, $crcerrs) = ($1,$2,$3,$4,$5);
+		debug("rxcheck reported $recvd packets, $missed missed, $resync resyncs, $maxstreak streak, $crcerrs crc errors")
+				if ($opts{d});
+
+		my $lastcheck = $sensorhealth{lastcheck};
+		my $lastrecvd = $sensorhealth{received};
+
+		if ($lastcheck and $lastrecvd and $lastrecvd <= $recvd)
+		{
 	    # packets are sent every 2.5 seconds. we call the sensor dead if 
 	    # less than half the expected packets make it in.
 	    my $expected = ($now - $lastcheck) / 2.5;
 
 	    if ($recvd - $lastrecvd < $expected*0.5)
 	    {
-		my $warning = sprintf("expected %d packets but only received %d, sensor down.",
-					 $expected, $recvd - $lastrecvd);
-		syslog(LOG_WARNING, $warning);
-		debug($warning) if ($opts{d});
-		$warning = sprintf("last check at %d: %d rcvd, %d missed, %d resync. now: %d rcvd, %d missed, %d resync",
-				   $lastcheck, $sensorhealth{received}, $sensorhealth{missed}, $sensorhealth{resync},
-				   $recvd, $missed, $resync);
-		syslog(LOG_WARNING, $warning);
-		debug($warning) if ($opts{d});
+				my $warning = sprintf("expected %d packets but only received %d, sensor down.",
+															$expected, $recvd - $lastrecvd);
+				syslog(LOG_WARNING, $warning);
+				debug($warning) if ($opts{d});
+				$warning = sprintf("last check at %d: %d rcvd, %d missed, %d resync. now: %d rcvd, %d missed, %d resync",
+													 $lastcheck, $sensorhealth{received}, $sensorhealth{missed}, $sensorhealth{resync},
+													 $recvd, $missed, $resync);
+				syslog(LOG_WARNING, $warning);
+				debug($warning) if ($opts{d});
 
-		$sensorhealth{ok} = 0;
+				$sensorhealth{ok} = 0;
 	    }
 	    else
 	    {
-		$sensorhealth{ok} = 1;
-		debug("expected $expected packets, received ".($recvd-$lastrecvd).", above the threshold of ".($expected/2))
-		    if ($opts{d});
+				$sensorhealth{ok} = 1;
+				debug("expected $expected packets, received ".($recvd-$lastrecvd).", above the threshold of ".($expected/2))
+						if ($opts{d});
 	    }
-	}
-	else
-	{
+		}
+		else
+		{
 	    $sensorhealth{ok} = 1; # startup or counter rollover, let's assume ok
-	}
+		}
 
-	$sensorhealth{lastcheck} = $now;
-	$sensorhealth{received} = $recvd;
-	$sensorhealth{missed} = $missed;
-	$sensorhealth{resync} = $resync;
-	return undef;
-    }
-    return faillog("rxcheck response unparseable, got \"$fullresponse\"");
+		$sensorhealth{lastcheck} = $now;
+		$sensorhealth{received} = $recvd;
+		$sensorhealth{missed} = $missed;
+		$sensorhealth{resync} = $resync;
+		return undef;
+	}
+	return faillog("rxcheck response unparseable, got \"$fullresponse\"");
 }
 
 
 # get davis' idea of time, returns undef on error
 sub gettime
 {
-    catch_up;
-    return undef if (!davis_write("GETTIME\n"));
-    my ($count, $response) = davis_read(9); # ack char, 6 bytes of data, 2 crc
-    return undef if ($count != 9);
+	catch_up;
+	return undef if (!davis_write("GETTIME\n"));
+	my ($count, $response) = davis_read(9); # ack char, 6 bytes of data, 2 crc
+	return undef if ($count != 9);
 
-    my ($ack, $sec, $min, $hr, $day, $month, $year, $crcin) = unpack("CC6n", $response);
-    return undef if ($ack != 6);
+	my ($ack, $sec, $min, $hr, $day, $month, $year, $crcin) = unpack("CC6n", $response);
+	return undef if ($ack != 6);
 
-    return undef if (davis_crc(substr($response,1,6)) != $crcin);
+	return undef if (davis_crc(substr($response,1,6)) != $crcin);
 
-    # seconds minutes hour day month year-1900
-    return POSIX::mktime($sec, $min, $hr, $day, $month-1, $year);
+	# seconds minutes hour day month year-1900
+	return POSIX::mktime($sec, $min, $hr, $day, $month-1, $year);
 }
 
 # set davis time, returns undef if ok, error message otherwise
 sub settime
 {
-    my ($newtime) = @_;
+	my ($newtime) = @_;
 
-    catch_up;
-    return faillog("write settime failed: $!") if (!davis_write("SETTIME\n"));
-    my ($count, $response) = davis_read(1); # ack
-    return faillog("no ack on settime, got 0x"
-		   .hexdump($response)) if (!$count or $response ne "\x06");
+	catch_up;
+	return faillog("write settime failed: $!") if (!davis_write("SETTIME\n"));
+	my ($count, $response) = davis_read(1); # ack
+	return faillog("no ack on settime, got 0x"
+								 .hexdump($response)) if (!$count or $response ne "\x06");
 
-    my @timelist = localtime($newtime);
-    # sec min hr d m y-1900
-    my $settimedata = pack("CCCCCC", $timelist[0], $timelist[1], $timelist[2],
-			   $timelist[3], $timelist[4]+1, $timelist[5]);
-    my $newcrc = davis_crc($settimedata);
+	my @timelist = localtime($newtime);
+	# sec min hr d m y-1900
+	my $settimedata = pack("CCCCCC", $timelist[0], $timelist[1], $timelist[2],
+												 $timelist[3], $timelist[4]+1, $timelist[5]);
+	my $newcrc = davis_crc($settimedata);
 
-    $settimedata .= pack("n",$newcrc);
+	$settimedata .= pack("n",$newcrc);
 
-    return faillog("write settime data failed: $!") 
-	if (!davis_write($settimedata));
-    ($count, $response) = davis_read(1); # should return ack 0x06, may return nak 0x21
-    return faillog("no ack on settime data, got 0x".hexdump($response)) 
-	if (!$count or $response ne "\x06");
+	return faillog("write settime data failed: $!") 
+			if (!davis_write($settimedata));
+	($count, $response) = davis_read(1); # should return ack 0x06, may return nak 0x21
+	return faillog("no ack on settime data, got 0x".hexdump($response)) 
+			if (!$count or $response ne "\x06");
 
-    return undef;
+	return undef;
 }
 
 # convert inch-hg to millibar, note: no temp correction
 sub mbar
 {
-    my ($inhg) = @_;
-    return $inhg / 0.0295301;
+	my ($inhg) = @_;
+	return $inhg / 0.0295301;
 }
 
 sub celsius
 {
-    my ($f) = @_;
+	my ($f) = @_;
 
-    return ($f - 32)*5/9;
+	return ($f - 32)*5/9;
 }
 
 sub kmh
 {
-    my ($mph) = @_;
-    return $mph * 1.609344;
+	my ($mph) = @_;
+	return $mph * 1.609344;
 }
-   
+
 
 # send one LPS request for both LOOP and LOOP2 data
 # returns: (error, undef) or (undef, parsed data)
 sub getdata
 {
-    # interrupt whatever the thing is doing
-    wake_up;
-    # give me one each...for a total of two. oh man...
-    return faillog("write LPS failed: $!") if (!davis_write("LPS 3 2\n"));
-    my ($count, $response) = davis_read(1); # ack or nak
-    return faillog("no ack for LPS, got 0x".hexdump($response)) 
-	if (!$count or $response ne "\x06");
+	# interrupt whatever the thing is doing
+	wake_up;
+	# give me one each...for a total of two. oh man...
+	return faillog("write LPS failed: $!") if (!davis_write("LPS 3 2\n"));
+	my ($count, $response) = davis_read(1); # ack or nak
+	return faillog("no ack for LPS, got 0x".hexdump($response)) 
+			if (!$count or $response ne "\x06");
 
-    # the loop packet first, which we only want for the xmitter battery status
-    # apparently bits in that (undocumented) byte are set one per xmitter if the cap is low
-    ($count, $response) = davis_read(99);
-    return faillog("no LPS LOOP response") if (!$count);
-    return faillog("incomplete LOOP response, got $count bytes only") if ($count != 99);
+	# the loop packet first, which we only want for the xmitter battery status
+	# apparently bits in that (undocumented) byte are set one per xmitter if the cap is low
+	($count, $response) = davis_read(99);
+	return faillog("no LPS LOOP response") if (!$count);
+	return faillog("incomplete LOOP response, got $count bytes only") if ($count != 99);
 
-    my @otherstuff = unpack("a3 C2 s3 C s C2 s C7 C4 C4 C C7 s C s2 s7 C4 C4 C2 s C8 C4 C s C2 s2 C2 n", $response);
+	my @otherstuff = unpack("a3 C2 s3 C s C2 s C7 C4 C4 C C7 s C s2 s7 C4 C4 C2 s C8 C4 C s C2 s2 C2 n", $response);
 
-    return faillog("invalid LPS LOOP response, no LOO") 
-	if ($otherstuff[0] ne "LOO");
-    my $crcin = $otherstuff[-1];
-    my $crc = davis_crc(substr($response,0,97));
-    return faillog("invalid LPS LOOP response, bad crc (got $crcin, computed $crc)")
-	if ($crcin != $crc);
+	return faillog("invalid LPS LOOP response, no LOO") 
+			if ($otherstuff[0] ne "LOO");
+	my $crcin = $otherstuff[-1];
+	my $crc = davis_crc(substr($response,0,97));
+	return faillog("invalid LPS LOOP response, bad crc (got $crcin, computed $crc)")
+			if ($crcin != $crc);
 
-    # and the _actually_ interesting data
-    ($count, $response) = davis_read(99);
-    return faillog("no LPS LOOP2 response") if (!$count);
-    return faillog("incomplete LOOP2 response, got $count bytes only") if ($count != 99);
-    
-    my @stuff = unpack("a3 C2 s3 C s C2 s8 C3 s4 C S8 C s5 C12 s6 C2 n", $response);
-    return faillog("invalid LPS LOOP2 response, no LOO") 
-	if ($stuff[0] ne "LOO");
-    $crcin = $stuff[-1];
-    $crc = davis_crc(substr($response,0,97));
-    return faillog("invalid LPS LOOP2 response, bad crc (got $crcin, computed $crc)") 
-	if ($crcin != $crc);
-    
-    my %weather = ( # don't need header
-		    tx_batt_low => $otherstuff[-9],
-		    bartrend => $stuff[1],
-		    # don't care about packettype => $stuff[2],
-		    # unused word, should be 7fff
-		    barometer => mbar($stuff[4]/1000),
-		    inside_temp => celsius($stuff[5]/10),
-		    inside_hum => $stuff[6], # in percent
-		    outside_temp => celsius($stuff[7]/10),
-		    wind_speed => kmh($stuff[8]), # was mph
-		    # unused byte, should be ff
-		    wind_dir => $stuff[10],
-		    wind_speed_avg10 => kmh($stuff[11]/10), 
-		    wind_speed_avg2 => kmh($stuff[12]/10),
-		    wind_speed_gust10 => kmh($stuff[13]), # datasheet is WRONG, says 0.1mph but its mpm
-		    wind_dir_gust10 => $stuff[14],
-		    # unused 0x7fff x 2
-		    dewpoint => celsius($stuff[17]),
-		    # unused 0xff
-		    outside_hum => $stuff[19],
-		    # unused 0xff
-		    heat_index => celsius($stuff[21]),
-		    wind_chill => celsius($stuff[22]),
-		    thsw_index => celsius($stuff[23]),
-		    rain_rate => $stuff[24]*0.2, # was clicks per hour, now mm/hr
-		    uv => $stuff[25],
-		    radiation => $stuff[26],
-		    storm_rain_clicks => $stuff[27]*0.2, # was clicks of 0.2mm, now mm/hr
-		    # storm_start is a bitfield
-		    daily_rain => $stuff[29]*0.2, # was clicks, now mm/hr
-		    rain_15m => $stuff[30]*0.2, # was clicks
-		    rain_60m => $stuff[31]*0.2,
-		    daily_et => ($stuff[32]/1000)*2.54, # inch to mm
-		    rain_24h => $stuff[33]*0.2, # was clicks
-		    baro_red => $stuff[34],
-		    baro_offset => mbar($stuff[35]/1000),
-		    baro_cal => ($stuff[36]/1000)*2.54,
-		    baro_raw => mbar($stuff[37]/1000),
-		    baro_abs => mbar($stuff[38]/1000),
-		    alt => $stuff[39]/1000*2.54/1000, # 0.001 inch to m, but this seems nonsensical data
-		    # the rest we don't care about, graph pointers and other gunk 
-	);
+	# and the _actually_ interesting data
+	($count, $response) = davis_read(99);
+	return faillog("no LPS LOOP2 response") if (!$count);
+	return faillog("incomplete LOOP2 response, got $count bytes only") if ($count != 99);
+	
+	my @stuff = unpack("a3 C2 s3 C s C2 s8 C3 s4 C S8 C s5 C12 s6 C2 n", $response);
+	return faillog("invalid LPS LOOP2 response, no LOO") 
+			if ($stuff[0] ne "LOO");
+	$crcin = $stuff[-1];
+	$crc = davis_crc(substr($response,0,97));
+	return faillog("invalid LPS LOOP2 response, bad crc (got $crcin, computed $crc)") 
+			if ($crcin != $crc);
+	
+	my %weather = ( # don't need header
+									tx_batt_low => $otherstuff[-9],
+									bartrend => $stuff[1],
+									# don't care about packettype => $stuff[2],
+									# unused word, should be 7fff
+									barometer => mbar($stuff[4]/1000),
+									inside_temp => celsius($stuff[5]/10),
+									inside_hum => $stuff[6], # in percent
+									outside_temp => celsius($stuff[7]/10),
+									wind_speed => kmh($stuff[8]), # was mph
+									# unused byte, should be ff
+									wind_dir => $stuff[10],
+									wind_speed_avg10 => kmh($stuff[11]/10), 
+									wind_speed_avg2 => kmh($stuff[12]/10),
+									wind_speed_gust10 => kmh($stuff[13]), # datasheet is WRONG, says 0.1mph but its mpm
+									wind_dir_gust10 => $stuff[14],
+									# unused 0x7fff x 2
+									dewpoint => celsius($stuff[17]),
+									# unused 0xff
+									outside_hum => $stuff[19],
+									# unused 0xff
+									heat_index => celsius($stuff[21]),
+									wind_chill => celsius($stuff[22]),
+									thsw_index => celsius($stuff[23]),
+									rain_rate => $stuff[24]*0.2, # was clicks per hour, now mm/hr
+									uv => $stuff[25],
+									radiation => $stuff[26],
+									storm_rain_clicks => $stuff[27]*0.2, # was clicks of 0.2mm, now mm/hr
+									# storm_start is a bitfield
+									daily_rain => $stuff[29]*0.2, # was clicks, now mm/hr
+									rain_15m => $stuff[30]*0.2, # was clicks
+									rain_60m => $stuff[31]*0.2,
+									daily_et => ($stuff[32]/1000)*2.54, # inch to mm
+									rain_24h => $stuff[33]*0.2, # was clicks
+									baro_red => $stuff[34],
+									baro_offset => mbar($stuff[35]/1000),
+									baro_cal => ($stuff[36]/1000)*2.54,
+									baro_raw => mbar($stuff[37]/1000),
+									baro_abs => mbar($stuff[38]/1000),
+									alt => $stuff[39]/1000*2.54/1000, # 0.001 inch to m, but this seems nonsensical data
+									# the rest we don't care about, graph pointers and other gunk 
+			);
 
-    # decode and sanitize the fairly ugly bitfield
-    my $stormstart = $stuff[28];
-    if ($stormstart != 0xffff)
-    {
-	$weather{storm_start_year} = 2000 + ($stormstart & 127);
-	$stormstart >>= 7;
-	$weather{storm_start_day} = $stormstart & 31;
-	$stormstart >>= 5;
-	$weather{storm_start_month} = $stormstart;
-    }
-    else
-    {
-	$weather{storm_start_month} = $weather{storm_start_day} = $weather{storm_start_year} = undef;
-    }
+	# decode and sanitize the fairly ugly bitfield
+	my $stormstart = $stuff[28];
+	if ($stormstart != 0xffff)
+	{
+		$weather{storm_start_year} = 2000 + ($stormstart & 127);
+		$stormstart >>= 7;
+		$weather{storm_start_day} = $stormstart & 31;
+		$stormstart >>= 5;
+		$weather{storm_start_month} = $stormstart;
+	}
+	else
+	{
+		$weather{storm_start_month} = $weather{storm_start_day} = $weather{storm_start_year} = undef;
+	}
 
-    # sanity-check inputs, add health record for problematic ones
-    for my $fixme (qw(baro_abs baro_raw barometer))
-    {
-	# baro: 20 .. 33 inhg, or 677..1117 mbar
-	$weather{"${fixme}_range"} = 1 if ($weather{$fixme} < 677 or $weather{$fixme} > 1117);
-    }
-    for my $fixme (qw(wind_dir wind_dir_gust10))
-    {
-	# these are 0! when dud, and 360 means north.
-	$weather{"${fixme}_range"} = 1 if (!$weather{$fixme});
-    }
-   
-    for my $fixme ( [ "outside_temp", 1802 ], # raw 7fff or 32767 in f
-		    [ "outside_hum", 255 ],
-		    [ "rain_rate", 6553 ],# raw 7fff or 32767 in clicks
-		    [ "wind_speed", 410 ], # raw 255
-		    [ "wind_speed_gust10", 410 ], # raw 255
-		    [ "wind_speed_avg2", 5273 ], # they return 7fff or 32767 if n/a. bah.
-		    [ "wind_speed_avg10", 5273 ],
-		    [ "thsw_index", 18186 ], # they return 7fff or 32767 if n/a. bah.
-		    [ "wind_chill", 18186 ],
-		    [ "heat_index", 18186 ],
-	)
-    {
-	my ($name, $max) = @$fixme;
-	$weather{"${name}_range"} = 1 if ($weather{$name} >= $max);
-    }
-    $weather{rain_rate_range} = 1 if ($weather{rain_rate} < 0);
-        
-    return (undef, \%weather);
+	# sanity-check inputs, add health record for problematic ones
+	for my $fixme (qw(baro_abs baro_raw barometer))
+	{
+		# baro: 20 .. 33 inhg, or 677..1117 mbar
+		$weather{"${fixme}_range"} = 1 if ($weather{$fixme} < 677 or $weather{$fixme} > 1117);
+	}
+	for my $fixme (qw(wind_dir wind_dir_gust10))
+	{
+		# these are 0! when dud, and 360 means north.
+		$weather{"${fixme}_range"} = 1 if (!$weather{$fixme});
+	}
+	
+	for my $fixme ( [ "outside_temp", 1802 ], # raw 7fff or 32767 in f
+									[ "outside_hum", 255 ],
+									[ "rain_rate", 6553 ],# raw 7fff or 32767 in clicks
+									[ "wind_speed", 410 ], # raw 255
+									[ "wind_speed_gust10", 410 ], # raw 255
+									[ "wind_speed_avg2", 5273 ], # they return 7fff or 32767 if n/a. bah.
+									[ "wind_speed_avg10", 5273 ],
+									[ "thsw_index", 18186 ], # they return 7fff or 32767 if n/a. bah.
+									[ "wind_chill", 18186 ],
+									[ "heat_index", 18186 ],
+			)
+	{
+		my ($name, $max) = @$fixme;
+		$weather{"${name}_range"} = 1 if ($weather{$name} >= $max);
+	}
+	$weather{rain_rate_range} = 1 if ($weather{rain_rate} < 0);
+	
+	return (undef, \%weather);
 }
 
 # the davis crc is NOT the same as the standard CRC-CCITT.
@@ -653,52 +661,52 @@ sub getdata
 # returns: numeric crc value 
 sub davis_crc
 {
-    # Expects packed data... 
-    my $data_str = shift @_;
+	# Expects packed data... 
+	my $data_str = shift @_;
 
-    my @crc_table = (
-	0x0, 0x1021, 0x2042, 0x3063, 0x4084, 0x50a5, 0x60c6, 0x70e7,
-	0x8108, 0x9129, 0xa14a, 0xb16b, 0xc18c, 0xd1ad, 0xe1ce, 0xf1ef,
-	0x1231, 0x210, 0x3273, 0x2252, 0x52b5, 0x4294, 0x72f7, 0x62d6,
-	0x9339, 0x8318, 0xb37b, 0xa35a, 0xd3bd, 0xc39c, 0xf3ff, 0xe3de,
-	0x2462, 0x3443, 0x420, 0x1401, 0x64e6, 0x74c7, 0x44a4, 0x5485,
-	0xa56a, 0xb54b, 0x8528, 0x9509, 0xe5ee, 0xf5cf, 0xc5ac, 0xd58d,
-	0x3653, 0x2672, 0x1611, 0x630, 0x76d7, 0x66f6, 0x5695, 0x46b4,
-	0xb75b, 0xa77a, 0x9719, 0x8738, 0xf7df, 0xe7fe, 0xd79d, 0xc7bc,
-	0x48c4, 0x58e5, 0x6886, 0x78a7, 0x840, 0x1861, 0x2802, 0x3823,
-	0xc9cc, 0xd9ed, 0xe98e, 0xf9af, 0x8948, 0x9969, 0xa90a, 0xb92b,
-	0x5af5, 0x4ad4, 0x7ab7, 0x6a96, 0x1a71, 0xa50, 0x3a33, 0x2a12,
-	0xdbfd, 0xcbdc, 0xfbbf, 0xeb9e, 0x9b79, 0x8b58, 0xbb3b, 0xab1a,
-	0x6ca6, 0x7c87, 0x4ce4, 0x5cc5, 0x2c22, 0x3c03, 0xc60, 0x1c41,
-	0xedae, 0xfd8f, 0xcdec, 0xddcd, 0xad2a, 0xbd0b, 0x8d68, 0x9d49,
-	0x7e97, 0x6eb6, 0x5ed5, 0x4ef4, 0x3e13, 0x2e32, 0x1e51, 0xe70,
-	0xff9f, 0xefbe, 0xdfdd, 0xcffc, 0xbf1b, 0xaf3a, 0x9f59, 0x8f78,
-	0x9188, 0x81a9, 0xb1ca, 0xa1eb, 0xd10c, 0xc12d, 0xf14e, 0xe16f,
-	0x1080, 0xa1, 0x30c2, 0x20e3, 0x5004, 0x4025, 0x7046, 0x6067,
-	0x83b9, 0x9398, 0xa3fb, 0xb3da, 0xc33d, 0xd31c, 0xe37f, 0xf35e,
-	0x2b1, 0x1290, 0x22f3, 0x32d2, 0x4235, 0x5214, 0x6277, 0x7256,
-	0xb5ea, 0xa5cb, 0x95a8, 0x8589, 0xf56e, 0xe54f, 0xd52c, 0xc50d,
-	0x34e2, 0x24c3, 0x14a0, 0x481, 0x7466, 0x6447, 0x5424, 0x4405,
-	0xa7db, 0xb7fa, 0x8799, 0x97b8, 0xe75f, 0xf77e, 0xc71d, 0xd73c,
-	0x26d3, 0x36f2, 0x691, 0x16b0, 0x6657, 0x7676, 0x4615, 0x5634,
-	0xd94c, 0xc96d, 0xf90e, 0xe92f, 0x99c8, 0x89e9, 0xb98a, 0xa9ab,
-	0x5844, 0x4865, 0x7806, 0x6827, 0x18c0, 0x8e1, 0x3882, 0x28a3,
-	0xcb7d, 0xdb5c, 0xeb3f, 0xfb1e, 0x8bf9, 0x9bd8, 0xabbb, 0xbb9a,
-	0x4a75, 0x5a54, 0x6a37, 0x7a16, 0xaf1, 0x1ad0, 0x2ab3, 0x3a92,
-	0xfd2e, 0xed0f, 0xdd6c, 0xcd4d, 0xbdaa, 0xad8b, 0x9de8, 0x8dc9,
-	0x7c26, 0x6c07, 0x5c64, 0x4c45, 0x3ca2, 0x2c83, 0x1ce0, 0xcc1,
-	0xef1f, 0xff3e, 0xcf5d, 0xdf7c, 0xaf9b, 0xbfba, 0x8fd9, 0x9ff8,
-	0x6e17, 0x7e36, 0x4e55, 0x5e74, 0x2e93, 0x3eb2, 0xed1, 0x1ef0);
+	my @crc_table = (
+		0x0, 0x1021, 0x2042, 0x3063, 0x4084, 0x50a5, 0x60c6, 0x70e7,
+		0x8108, 0x9129, 0xa14a, 0xb16b, 0xc18c, 0xd1ad, 0xe1ce, 0xf1ef,
+		0x1231, 0x210, 0x3273, 0x2252, 0x52b5, 0x4294, 0x72f7, 0x62d6,
+		0x9339, 0x8318, 0xb37b, 0xa35a, 0xd3bd, 0xc39c, 0xf3ff, 0xe3de,
+		0x2462, 0x3443, 0x420, 0x1401, 0x64e6, 0x74c7, 0x44a4, 0x5485,
+		0xa56a, 0xb54b, 0x8528, 0x9509, 0xe5ee, 0xf5cf, 0xc5ac, 0xd58d,
+		0x3653, 0x2672, 0x1611, 0x630, 0x76d7, 0x66f6, 0x5695, 0x46b4,
+		0xb75b, 0xa77a, 0x9719, 0x8738, 0xf7df, 0xe7fe, 0xd79d, 0xc7bc,
+		0x48c4, 0x58e5, 0x6886, 0x78a7, 0x840, 0x1861, 0x2802, 0x3823,
+		0xc9cc, 0xd9ed, 0xe98e, 0xf9af, 0x8948, 0x9969, 0xa90a, 0xb92b,
+		0x5af5, 0x4ad4, 0x7ab7, 0x6a96, 0x1a71, 0xa50, 0x3a33, 0x2a12,
+		0xdbfd, 0xcbdc, 0xfbbf, 0xeb9e, 0x9b79, 0x8b58, 0xbb3b, 0xab1a,
+		0x6ca6, 0x7c87, 0x4ce4, 0x5cc5, 0x2c22, 0x3c03, 0xc60, 0x1c41,
+		0xedae, 0xfd8f, 0xcdec, 0xddcd, 0xad2a, 0xbd0b, 0x8d68, 0x9d49,
+		0x7e97, 0x6eb6, 0x5ed5, 0x4ef4, 0x3e13, 0x2e32, 0x1e51, 0xe70,
+		0xff9f, 0xefbe, 0xdfdd, 0xcffc, 0xbf1b, 0xaf3a, 0x9f59, 0x8f78,
+		0x9188, 0x81a9, 0xb1ca, 0xa1eb, 0xd10c, 0xc12d, 0xf14e, 0xe16f,
+		0x1080, 0xa1, 0x30c2, 0x20e3, 0x5004, 0x4025, 0x7046, 0x6067,
+		0x83b9, 0x9398, 0xa3fb, 0xb3da, 0xc33d, 0xd31c, 0xe37f, 0xf35e,
+		0x2b1, 0x1290, 0x22f3, 0x32d2, 0x4235, 0x5214, 0x6277, 0x7256,
+		0xb5ea, 0xa5cb, 0x95a8, 0x8589, 0xf56e, 0xe54f, 0xd52c, 0xc50d,
+		0x34e2, 0x24c3, 0x14a0, 0x481, 0x7466, 0x6447, 0x5424, 0x4405,
+		0xa7db, 0xb7fa, 0x8799, 0x97b8, 0xe75f, 0xf77e, 0xc71d, 0xd73c,
+		0x26d3, 0x36f2, 0x691, 0x16b0, 0x6657, 0x7676, 0x4615, 0x5634,
+		0xd94c, 0xc96d, 0xf90e, 0xe92f, 0x99c8, 0x89e9, 0xb98a, 0xa9ab,
+		0x5844, 0x4865, 0x7806, 0x6827, 0x18c0, 0x8e1, 0x3882, 0x28a3,
+		0xcb7d, 0xdb5c, 0xeb3f, 0xfb1e, 0x8bf9, 0x9bd8, 0xabbb, 0xbb9a,
+		0x4a75, 0x5a54, 0x6a37, 0x7a16, 0xaf1, 0x1ad0, 0x2ab3, 0x3a92,
+		0xfd2e, 0xed0f, 0xdd6c, 0xcd4d, 0xbdaa, 0xad8b, 0x9de8, 0x8dc9,
+		0x7c26, 0x6c07, 0x5c64, 0x4c45, 0x3ca2, 0x2c83, 0x1ce0, 0xcc1,
+		0xef1f, 0xff3e, 0xcf5d, 0xdf7c, 0xaf9b, 0xbfba, 0x8fd9, 0x9ff8,
+		0x6e17, 0x7e36, 0x4e55, 0x5e74, 0x2e93, 0x3eb2, 0xed1, 0x1ef0);
 
-    my $crc = 0;
-    my @data = unpack("c*", $data_str);
-    foreach my $elem (@data)
-    {
-	my $index = $crc >> 8 ^ $elem;
-	my $lhs = $crc_table[$index];
-	my $rhs = ($crc << 8) & 0xFFFF;
-	$crc = $lhs ^ $rhs;
-    }
-    return $crc;
+	my $crc = 0;
+	my @data = unpack("c*", $data_str);
+	foreach my $elem (@data)
+	{
+		my $index = $crc >> 8 ^ $elem;
+		my $lhs = $crc_table[$index];
+		my $rhs = ($crc << 8) & 0xFFFF;
+		$crc = $lhs ^ $rhs;
+	}
+	return $crc;
 }
 
